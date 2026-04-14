@@ -1,0 +1,31 @@
+---
+ems_calibration:
+  module: ems_calibration
+  class: EmsCalibration
+  log_level: INFO
+
+ems_forecasts:
+  module: ems_forecasts
+  class: EmsForecasts
+  log_level: INFO
+
+ems_planner:
+  module: ems_planner
+  class: EmsPlanner
+  log_level: INFO
+
+ems_strategy:
+  module: ems_strategy
+  class: EmsStrategy
+  log_level: INFO
+
+ems_battery_sim:
+  module: ems_battery_sim
+  class: EmsBatterySim
+  log_level: INFO
+
+ems_bat_controller:
+  module: ems_bat_controller
+  class: EmsBatController
+  log_level: INFO
+

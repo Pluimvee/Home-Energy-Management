@@ -8,10 +8,8 @@ last 14 days).
 Coefficients
 ------------
   k          kWh_th/(°C·h)   House heat-loss: thermal demand per ΔT degree
-  beta_irr   °C/W_irr        Solar gain: irradiance → effective indoor temp rise
   cop_a      –               COP intercept (COP at T_outdoor = 0 °C)
   cop_b      1/°C            COP slope (improvement per °C warmer outside)
-  irr_scale  –               Clear-sky irradiance scale vs sensor readings
   temp_bias_a / temp_bias_b  OLS: actual_temp  = a × forecast_temp  + b
   irr_bias_a  / irr_bias_b   OLS: actual_irr   = a × forecast_irr   + b
 
@@ -30,8 +28,6 @@ Data sources  (hourly statistics via HA REST API)
 Physical models
 ---------------
   k      :  P_thermal [kW] = k × (T_setpoint – T_outdoor)
-  beta   :  T_eff = T_outdoor + beta_irr × irr
-             HP demand = max(0, k × (T_setpoint – T_eff))
   COP    :  COP = cop_a + cop_b × T_outdoor
              (linear, fitted from derived COP per hour)
 
@@ -59,11 +55,8 @@ import appdaemon.plugins.hass.hassapi as hass
 
 from ems_base import (
     HP_SETPOINT_ENTITY, HH_ENERGY_SOURCES,
-    I0_CLEAR,
-    clear_sky_w as _clear_sky_w,
 )
 from ems_heating import (
-    SOLAR_GAIN_WEIGHTS as _SOLAR_GAIN_WEIGHTS,
     GAMMA_DEFAULT,
     history_to_hourly_mean as _h_mean,
     history_to_hourly_cumul_change as _h_delta,
@@ -74,8 +67,11 @@ from ems_heating import (
 THERMAL_POWER_S  = "sensor.kamstrup_warmtepomp_power"          # W   thermal output (mean)
 THERMAL_ENERGY_S = "sensor.kamstrup_warmtepomp_energy_output"  # GJ  thermal output (sum→delta)
 HP_ENERGY_S      = "sensor.heatpump_energy"                    # kWh electrical input (sum→delta)
-HP_CTRL_ENERGY_S = "sensor.heatpump_control_energy"            # kWh controller+pump (sum→delta)
-HP_CH_MODE_S     = "binary_sensor.smartcontrol_ch_mode"        # on/off CH demand (binary)
+HP_CTRL_ENERGY_S   = "sensor.heatpump_control_energy"          # kWh controller+pump (sum→delta)
+HP_POWER_S         = "sensor.heatpump_power"                   # W   electrical input (mean)
+HP_CH_MODE_S       = "binary_sensor.smartcontrol_ch_mode"      # on/off CH demand (binary)
+BLACKBIRD_OUTPUT_S = "sensor.blackbird_p80_heat_pump_output_power"  # W  manufacturer thermal
+BLACKBIRD_INPUT_S  = "sensor.blackbird_p80_heat_pump_input_power"   # W  manufacturer electrical
 T_OUT_S          = "sensor.outsidetemp_outside_temperature"    # °C  outdoor temp (mean)
 T_IN_S           = "sensor.smartcontrol_inside"                # °C  room temp (mean)
 IRR_S            = "sensor.irradiance"                         # W   irradiance (mean)
@@ -99,23 +95,30 @@ _BINARY_SENSORS = {HP_CH_MODE_S}
 _STALE_ATTRS = frozenset(
     [f"hh_h{h:02d}"      for h in range(24)] +
     [f"pv_eta_h{h:02d}"  for h in range(24)] +
-    ["gamma", "gamma_samples", "gamma_n_off", "gamma_n_on"]
+    ["gamma", "gamma_samples", "gamma_n_off", "gamma_n_on",
+     "irr_scale", "irr_bias_b", "cop_c", "cop_model", "cop_r2"]
 )
 
 GJ_TO_KWH = 1000.0 / 3.6   # 1 GJ = 277.78 kWh
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
-CALIB_DAYS        = 14     # days of statistics to use
+CALIB_DAYS              = 14    # days for k / bias / energy calibration
+CALIB_DAYS_COP_VALIDATE = 90    # days to cross-validate kamstrup vs Blackbird
+CALIB_DAYS_COP_FIT      = 365   # days for COP(T) long-term fit
+COP_FIT_VALID_DAYS      = 180   # only re-fit when older than this
 HP_ACTIVE_W       = 200.0  # thermal W threshold above which HP is considered active
+HP_RUNNING_W      = 300.0  # W   min compressor input to count as "running" for COP fit
 IRR_ACTIVE_W      = 50.0   # irradiance W threshold (general: pv_eta, k exclusion)
 IRR_GAMMA_H_MIN_W = 100.0  # minimum irradiance for gamma_h calibration samples
                             # 50 W is sufficient for pv_eta (pure ratio) but not for gamma_h:
                             # at dawn/dusk the thermal-inertia noise in k×ΔT dominates
                             # the numerator, amplified by the low irr denominator
 MIN_K_SAMPLES     = 12     # minimum active HP hours for reliable k
-MIN_BETA_SAMPLES  = 5      # minimum standby+sun hours for reliable beta
-MIN_COP_SAMPLES   = 10     # minimum active hours for reliable COP regression
+MIN_COP_SAMPLES        = 50    # minimum (T, COP) pairs for long-term fit
+COP_AGREE_MAPE_THRESH  = 0.25  # max acceptable MAPE for Blackbird vs kamstrup validation
+COP_QUADRATIC_R2_GAIN  = 0.05  # min R² improvement to justify using quadratic over linear
+COP_QUADRATIC_TEMP_SPAN = 15.0 # min °C temperature range to attempt quadratic fit
 MIN_ELEC_KWH      = 0.05   # kWh minimum electrical energy per hour for valid COP sample
 MIN_BIAS_SAMPLES  = 24     # minimum aligned pairs for reliable forecast bias regression
 MIN_HH_SAMPLES    = 3      # minimum hourly samples per hour-of-day bucket for HH baseline
@@ -125,12 +128,9 @@ MIN_GAMMA_H_SAMPLES = 1    # minimum samples per hour bucket for solar-gain gamm
 # ── Fallback defaults (used when calibration data is insufficient) ─────────────
 
 K_DEF            = 0.050
-BETA_DEF         = 0.0
 COP_A_DEF        = 3.5
 COP_B_DEF        = 0.08
 COP_C_DEF        = 0.0    # quadratic term; 0.0 = linear fallback
-IRR_SCALE_DEF    = 1.0
-SOLAR_SCALE_DEF  = 1.0
 TEMP_BIAS_A_DEF  = 1.0   # no correction: actual = 1.0 × forecast + 0.0
 TEMP_BIAS_B_DEF  = 0.0
 IRR_BIAS_A_DEF   = 1.0
@@ -146,25 +146,24 @@ class EmsCalibration(hass.Hass):
         # Publish a clean full-defaults state immediately to wipe any stale attributes
         # from previous schema versions (flat hh_hXX, pv_eta_hXX, scalar gamma, etc.).
         t_sp = self._sensor_float(HP_SETPOINT_ENTITY, 20.5)
-        clean = {**self._defaults_thermal(t_sp), **self._defaults_energy()}
+        clean = {**self._defaults_thermal(t_sp), **self._defaults_cop(), **self._defaults_energy()}
         self.set_state(CALIB_ENTITY, state="initializing", attributes=clean, replace=True)
 
         self.run_in(self._calibrate_thermal, 30)
         self.run_in(self._calibrate_energy, 120)
+        self.run_in(self._calibrate_cop, 180)        # long-term; skips if fit is still fresh
         self.run_daily(self._calibrate_thermal, "03:00:00")
         self.run_daily(self._calibrate_energy, "03:30:00")
 
     # ── Trigger handlers ──────────────────────────────────────────────────────
 
     def _calibrate_thermal(self, kwargs):
-        """k, beta, COP, irr_scale, temp_bias, irr_bias — thermal sensor subset."""
+        """k, temp_bias, irr_bias — thermal sensor subset (COP handled by _calibrate_cop)."""
         t_sp  = self._sensor_float(HP_SETPOINT_ENTITY, 20.5)
         end   = datetime.datetime.now(datetime.timezone.utc)
         start = end - datetime.timedelta(days=CALIB_DAYS)
 
-        sensors = [THERMAL_POWER_S, THERMAL_ENERGY_S, HP_ENERGY_S,
-                   HP_CTRL_ENERGY_S, T_OUT_S, IRR_S,
-                   FORECAST_TEMP_S, FORECAST_IRR_S]
+        sensors = [THERMAL_POWER_S, T_OUT_S, IRR_S, FORECAST_TEMP_S, FORECAST_IRR_S]
         try:
             hours = self._fetch_and_align(start, end, sensors)
         except Exception as exc:
@@ -177,37 +176,21 @@ class EmsCalibration(hass.Hass):
             self._publish(self._defaults_thermal(t_sp))
             return
 
-        k,     n_k    = self._fit_k(hours, t_sp)
-        beta,  n_beta = self._fit_beta(hours)
-        cop_a, cop_b, cop_c, n_cop = self._fit_cop(hours)
-        irr_scale     = self._fit_irr_scale(hours)
+        k,           n_k         = self._fit_k(hours, t_sp)
         temp_bias_a, temp_bias_b, n_temp_bias = self._fit_temp_bias(hours)
-        irr_bias_a,  irr_bias_b,  n_irr_bias  = self._fit_irr_bias(hours)
+        irr_bias_a,  n_irr_bias              = self._fit_irr_bias(hours)
 
-        if n_k   < MIN_K_SAMPLES:    k = K_DEF
-        if n_beta < MIN_BETA_SAMPLES: beta = BETA_DEF
-        if n_cop < MIN_COP_SAMPLES:  cop_a, cop_b, cop_c = COP_A_DEF, COP_B_DEF, COP_C_DEF
+        if n_k < MIN_K_SAMPLES:
+            k = K_DEF
 
         source = "calibrated" if n_k >= MIN_K_SAMPLES else "default"
-        solar_scale = round(
-            float(self.get_state(CALIB_ENTITY, attribute="solar_scale") or SOLAR_SCALE_DEF), 4
-        )
         self._publish({
             "k":               round(k, 5),
             "k_samples":       n_k,
-            "beta_irr":        round(beta, 6) or 0.000001,
-            "beta_samples":    n_beta,
-            "cop_a":           round(cop_a, 3),
-            "cop_b":           round(cop_b, 4),
-            "cop_c":           round(cop_c, 5),
-            "cop_samples":     n_cop,
-            "irr_scale":       round(irr_scale, 4),
-            "solar_scale":     solar_scale,
             "temp_bias_a":     temp_bias_a,
             "temp_bias_b":     temp_bias_b,
             "temp_bias_n":     n_temp_bias,
             "irr_bias_a":      irr_bias_a,
-            "irr_bias_b":      irr_bias_b,
             "irr_bias_n":      n_irr_bias,
             "t_setpoint":      t_sp,
             "source":          source,
@@ -217,11 +200,8 @@ class EmsCalibration(hass.Hass):
         })
         self.log(
             f"[EnergyCalib:thermal] k={k:.4f}(n={n_k}) "
-            f"beta={beta:.5f}(n={n_beta}) "
-            f"cop={cop_a:.2f}+{cop_b:.3f}·T+{cop_c:.5f}·T²(n={n_cop}) "
-            f"irr_scale={irr_scale:.3f} "
             f"temp_bias={temp_bias_a:.3f}×+{temp_bias_b:.2f}(n={n_temp_bias}) "
-            f"irr_bias={irr_bias_a:.3f}×+{irr_bias_b:.1f}(n={n_irr_bias}) "
+            f"irr_bias={irr_bias_a:.3f}×(n={n_irr_bias}) "
             f"source={source} hours={len(hours)}"
         )
 
@@ -279,13 +259,13 @@ class EmsCalibration(hass.Hass):
     #   Mean sensors  : value = hourly mean via history_to_hourly_mean()
     #   Energy sensors: value = hourly delta via history_to_hourly_cumul_change()
 
-    def _fetch_and_align(self, start, end, sensors):
+    def _fetch_and_align(self, start, end, sensors, days=CALIB_DAYS):
         by_dt = {}
         for sensor_id in sensors:
             try:
                 history = self.get_history(
                     entity_id=sensor_id,
-                    days=CALIB_DAYS,
+                    days=days,
                 )
                 states = history[0] if history and history[0] else []
             except Exception as exc:
@@ -344,44 +324,6 @@ class EmsCalibration(hass.Hass):
             return K_DEF, 0
         return max(0.01, min(statistics.median(vals), 1.0)), len(vals)
 
-    # ── beta_irr: solar-gain coefficient ─────────────────────────────────────
-
-    def _fit_beta(self, hours):
-        """
-        Sampled on HP-standby hours with significant irradiance:
-          beta_irr  =  (T_indoor – T_outdoor) / effective_irr
-
-        effective_irr = irr_W × SOLAR_GAIN_WEIGHTS[hour]
-
-        The time-of-day weight (Gaussian peaked ~10:30) accounts for east-south-
-        facing windows: morning sun shines deep into the room; afternoon sun hits
-        the wrong wall and contributes little to indoor temperature.
-        Using the same weight as hp_per_slot() keeps calibration self-consistent.
-        """
-        vals = []
-        for dt, h in hours.items():
-            p_th  = h.get(THERMAL_POWER_S)
-            irr   = h.get(IRR_S)
-            t_out = h.get(T_OUT_S)
-            t_in  = h.get(T_IN_S)
-            if any(v is None for v in [p_th, irr, t_out, t_in]):
-                continue
-            if p_th >= HP_ACTIVE_W:
-                continue   # HP running → not a solar-gain standby hour
-            if irr < IRR_ACTIVE_W:
-                continue   # no significant irradiance
-            delta = t_in - t_out
-            if delta < 0.5:
-                continue   # indoor not meaningfully warmer than outdoor
-            effective_irr = irr * _SOLAR_GAIN_WEIGHTS[dt.hour]
-            if effective_irr < 1.0:
-                continue   # weight ≈ 0 at this hour; skip to avoid division noise
-            vals.append(delta / effective_irr)
-
-        if not vals:
-            return BETA_DEF, 0
-        return max(0.0, min(statistics.median(vals), 0.10)), len(vals)
-
     # ── COP: quadratic model vs outdoor temperature ───────────────────────────
 
     def _solve3(self, A, rhs):
@@ -404,66 +346,6 @@ class EmsCalibration(hass.Hass):
         for i in range(2, -1, -1):
             x[i] = (M[i][3] - sum(M[i][j] * x[j] for j in range(i + 1, 3))) / M[i][i]
         return x
-
-    def _fit_cop(self, hours):
-        """
-        COP  =  cop_a  +  cop_b × T  +  cop_c × T²
-
-        Quadratic model captures the non-linear COP drop near freezing caused by
-        defrost cycles and refrigerant behaviour, and the flattening at higher
-        outdoor temperatures.
-
-        COP derived per hour as:
-          COP = Δthermal_energy_kWh / Δ(hp_energy_kWh + ctrl_energy_kWh)
-        """
-        pts = []
-        for h in hours.values():
-            p_th       = h.get(THERMAL_POWER_S)
-            t_out      = h.get(T_OUT_S)
-            d_therm_gj = h.get(THERMAL_ENERGY_S)
-            d_hp_kwh   = h.get(HP_ENERGY_S)
-            d_ctrl_kwh = h.get(HP_CTRL_ENERGY_S, 0.0)
-
-            if p_th is None or t_out is None or d_therm_gj is None or d_hp_kwh is None:
-                continue
-            if p_th < HP_ACTIVE_W:
-                continue
-            elec_kwh = d_hp_kwh + d_ctrl_kwh
-            if elec_kwh < MIN_ELEC_KWH:
-                continue
-            thermal_kwh = d_therm_gj * GJ_TO_KWH
-            cop = thermal_kwh / elec_kwh
-            if not (1.0 <= cop <= 10.0):
-                continue
-            pts.append((t_out, cop))
-
-        n = len(pts)
-        if n < MIN_COP_SAMPLES:
-            return COP_A_DEF, COP_B_DEF, COP_C_DEF, n
-
-        # Normal equations for  y = a + b·x + c·x²
-        sx   = sum(p[0]         for p in pts)
-        sx2  = sum(p[0]**2      for p in pts)
-        sx3  = sum(p[0]**3      for p in pts)
-        sx4  = sum(p[0]**4      for p in pts)
-        sy   = sum(p[1]         for p in pts)
-        sxy  = sum(p[0]*p[1]    for p in pts)
-        sx2y = sum(p[0]**2*p[1] for p in pts)
-
-        A   = [[n,   sx,  sx2],
-               [sx,  sx2, sx3],
-               [sx2, sx3, sx4]]
-        rhs = [sy, sxy, sx2y]
-
-        coeffs = self._solve3(A, rhs)
-        if coeffs is None:
-            return COP_A_DEF, COP_B_DEF, COP_C_DEF, n
-
-        a, b, c = coeffs
-        a = max(1.0, min(a, 8.0))
-        b = max(-0.5, min(b, 0.5))
-        c = max(-0.05, min(c, 0.05))
-        return round(a, 3), round(b, 4), round(c, 5), n
 
     # ── forecast bias: temperature ─────────────────────────────────────────────
 
@@ -522,10 +404,198 @@ class EmsCalibration(hass.Hass):
             sum_fa += f * a
             n += 1
         if n < MIN_BIAS_SAMPLES or sum_ff < 1e-9:
-            return IRR_BIAS_A_DEF, IRR_BIAS_B_DEF, n
+            return IRR_BIAS_A_DEF, n
         a = sum_fa / sum_ff
         a = max(0.1, min(a, 3.0))
-        return round(a, 4), 0.0, n
+        return round(a, 4), n
+
+    # ── Long-term COP(T) calibration ─────────────────────────────────────────────
+
+    def _calibrate_cop(self, kwargs):
+        """
+        Fit COP(T) = a + b·T [+ c·T²] from long-term data.
+
+        Step 1 – validate (90 d): compare hourly-mean COP from Blackbird power
+                 sensors against kamstrup/heatpump sensors.  Aborts if MAPE
+                 exceeds COP_AGREE_MAPE_THRESH (25 %).
+        Step 2 – fit (365 d): collect (T_outdoor, COP) pairs from kamstrup /
+                 heatpump sensors and fit COP(T).
+        Step 3 – model selection: quadratic only when temperature span ≥ 15 °C
+                 AND R² improves by more than COP_QUADRATIC_R2_GAIN over linear.
+        Step 4 – publish cop_a, cop_b, cop_c, cop_samples, cop_r2, cop_model,
+                 cop_fit_date.
+
+        Skips when cop_fit_date attribute is fresher than COP_FIT_VALID_DAYS.
+        """
+        fit_date_str = self.get_state(CALIB_ENTITY, attribute="cop_fit_date")
+        if fit_date_str:
+            try:
+                fit_date = datetime.date.fromisoformat(fit_date_str)
+                age = (datetime.date.today() - fit_date).days
+                if age < COP_FIT_VALID_DAYS:
+                    self.log(f"[EnergyCalib:cop] fit is {age}d old (<{COP_FIT_VALID_DAYS}d) – skipping")
+                    return
+            except Exception:
+                pass
+
+        end = datetime.datetime.now(datetime.timezone.utc)
+
+        # ── Step 1: validate kamstrup vs Blackbird (90 days) ─────────────────
+        sensors_val = [BLACKBIRD_OUTPUT_S, BLACKBIRD_INPUT_S, THERMAL_POWER_S, HP_POWER_S]
+        try:
+            hours_val = self._fetch_and_align(
+                end - datetime.timedelta(days=CALIB_DAYS_COP_VALIDATE),
+                end, sensors_val, days=CALIB_DAYS_COP_VALIDATE,
+            )
+        except Exception as exc:
+            self.log(f"[EnergyCalib:cop] validation fetch failed: {exc}", level="WARNING")
+            return
+
+        mape, n_val = self._validate_cop_sensors(hours_val)
+        if n_val < 24:
+            self.log(f"[EnergyCalib:cop] only {n_val} validation hours – cannot validate",
+                     level="WARNING")
+            return
+        if mape > COP_AGREE_MAPE_THRESH:
+            self.log(
+                f"[EnergyCalib:cop] sensors disagree: MAPE={mape:.2f} > {COP_AGREE_MAPE_THRESH} "
+                f"(n={n_val}) – aborting", level="WARNING",
+            )
+            return
+        self.log(f"[EnergyCalib:cop] sensor validation OK: MAPE={mape:.2f} n={n_val}")
+
+        # ── Step 2: fetch 365 days of kamstrup + temperature ─────────────────
+        sensors_fit = [THERMAL_POWER_S, HP_POWER_S, T_OUT_S]
+        try:
+            hours_fit = self._fetch_and_align(
+                end - datetime.timedelta(days=CALIB_DAYS_COP_FIT),
+                end, sensors_fit, days=CALIB_DAYS_COP_FIT,
+            )
+        except Exception as exc:
+            self.log(f"[EnergyCalib:cop] 365d fetch failed: {exc}", level="WARNING")
+            return
+
+        pts = []
+        for h in hours_fit.values():
+            p_th  = h.get(THERMAL_POWER_S)
+            p_el  = h.get(HP_POWER_S)
+            t_out = h.get(T_OUT_S)
+            if p_th is None or p_el is None or t_out is None:
+                continue
+            if p_el < HP_RUNNING_W:
+                continue
+            cop = p_th / p_el
+            if not (1.0 <= cop <= 9.0):
+                continue
+            pts.append((t_out, cop))
+
+        if len(pts) < MIN_COP_SAMPLES:
+            self.log(f"[EnergyCalib:cop] only {len(pts)} valid samples – using defaults",
+                     level="WARNING")
+            return
+
+        # ── Step 3 + 4: fit and publish ───────────────────────────────────────
+        cop_a, cop_b, cop_c, r2, n, model = self._fit_cop_longterm(pts)
+        self._publish({
+            "cop_a":        round(cop_a, 3),
+            "cop_b":        round(cop_b, 4),
+            "cop_c":        round(cop_c, 5),
+            "cop_samples":  n,
+            "cop_r2":       round(r2, 4),
+            "cop_model":    model,
+            "cop_fit_date": datetime.date.today().isoformat(),
+        })
+        self.log(
+            f"[EnergyCalib:cop] {model}: a={cop_a:.3f} b={cop_b:.4f} c={cop_c:.5f} "
+            f"R²={r2:.3f} n={n}"
+        )
+
+    def _validate_cop_sensors(self, hours):
+        """
+        Compare hourly-mean COP from Blackbird vs kamstrup/heatpump sensors.
+        Returns (mape, n_valid_hours).
+        """
+        errors = []
+        for h in hours.values():
+            bb_out = h.get(BLACKBIRD_OUTPUT_S)
+            bb_in  = h.get(BLACKBIRD_INPUT_S)
+            km_th  = h.get(THERMAL_POWER_S)
+            km_el  = h.get(HP_POWER_S)
+            if any(v is None for v in [bb_out, bb_in, km_th, km_el]):
+                continue
+            if bb_in < HP_RUNNING_W or km_el < HP_RUNNING_W:
+                continue
+            cop_bb = bb_out / bb_in
+            cop_km = km_th  / km_el
+            if not (1.0 <= cop_bb <= 9.0) or not (1.0 <= cop_km <= 9.0):
+                continue
+            errors.append(abs(cop_bb - cop_km) / cop_bb)
+        if not errors:
+            return 1.0, 0
+        return sum(errors) / len(errors), len(errors)
+
+    def _fit_cop_longterm(self, pts):
+        """
+        Fit COP(T) = a + b·T [+ c·T²] from (T_outdoor, COP) pairs.
+
+        Uses quadratic only when temperature span ≥ COP_QUADRATIC_TEMP_SPAN
+        AND R²_quad > R²_linear + COP_QUADRATIC_R2_GAIN.
+        Returns (a, b, c, r2, n, model_str).
+        """
+        n     = len(pts)
+        temps = [p[0] for p in pts]
+        t_span = max(temps) - min(temps)
+
+        a_lin, b_lin = self._ols_linear(pts)
+        r2_lin = self._r2(pts, a_lin, b_lin, 0.0)
+
+        if t_span >= COP_QUADRATIC_TEMP_SPAN:
+            sx   = sum(p[0]          for p in pts)
+            sx2  = sum(p[0] ** 2     for p in pts)
+            sx3  = sum(p[0] ** 3     for p in pts)
+            sx4  = sum(p[0] ** 4     for p in pts)
+            sy   = sum(p[1]          for p in pts)
+            sxy  = sum(p[0] * p[1]   for p in pts)
+            sx2y = sum(p[0]**2*p[1]  for p in pts)
+            coeffs = self._solve3(
+                [[n,   sx,  sx2], [sx,  sx2, sx3], [sx2, sx3, sx4]],
+                [sy, sxy, sx2y],
+            )
+            if coeffs is not None:
+                a_q, b_q, c_q = coeffs
+                r2_quad = self._r2(pts, a_q, b_q, c_q)
+                if r2_quad > r2_lin + COP_QUADRATIC_R2_GAIN:
+                    a_q = max(1.5, min(a_q, 5.5))
+                    b_q = max(0.0,  min(b_q, 0.3))
+                    c_q = max(-0.05, min(c_q, 0.05))
+                    return a_q, b_q, c_q, r2_quad, n, "quadratic"
+
+        a_lin = max(1.5, min(a_lin, 5.5))
+        b_lin = max(0.0,  min(b_lin, 0.3))
+        return a_lin, b_lin, 0.0, r2_lin, n, "linear"
+
+    def _ols_linear(self, pts):
+        """OLS linear fit y = a + b·x. Returns (a, b)."""
+        n   = len(pts)
+        sx  = sum(p[0]       for p in pts)
+        sy  = sum(p[1]       for p in pts)
+        sx2 = sum(p[0] ** 2  for p in pts)
+        sxy = sum(p[0] * p[1] for p in pts)
+        den = n * sx2 - sx * sx
+        if abs(den) < 1e-9:
+            return sy / n, 0.0
+        b = (n * sxy - sx * sy) / den
+        a = (sy - b * sx) / n
+        return a, b
+
+    def _r2(self, pts, a, b, c):
+        """Coefficient of determination for y = a + b·x + c·x²."""
+        y_mean = sum(p[1] for p in pts) / len(pts)
+        ss_tot = sum((p[1] - y_mean) ** 2 for p in pts)
+        if ss_tot < 1e-9:
+            return 1.0
+        ss_res = sum((p[1] - (a + b * p[0] + c * p[0] ** 2)) ** 2 for p in pts)
+        return max(0.0, 1.0 - ss_res / ss_tot)
 
     # ── household baseline: per-hour-of-day median ────────────────────────────
 
@@ -565,8 +635,10 @@ class EmsCalibration(hass.Hass):
             else:
                 result.append(HH_H_DEF)
 
-        n_min = min(len(b) for b in buckets)
-        n_max = max(len(b) for b in buckets)
+        counts   = [len(b) for b in buckets]
+        non_zero = [c for c in counts if c > 0]
+        n_min = min(non_zero) if non_zero else 0
+        n_max = max(counts)   if counts   else 0
         return result, n_min, n_max
 
     # ── pv_eta: per-hour-of-day PV efficiency ────────────────────────────────
@@ -681,34 +753,6 @@ class EmsCalibration(hass.Hass):
         n_max = max(counts)   if counts   else 0
         return result, n_min, n_max
 
-    # ── irr_scale ─────────────────────────────────────────────────────────────
-
-    def _fit_irr_scale(self, hours):
-        """
-        Scale factor = 90th-percentile of (sensor_irr / clear_sky_model_irr)
-        for daytime hours where the clear-sky model predicts > 200 W.
-
-        This properly accounts for sensor tilt / orientation.  A south-facing
-        sensor can measure more than the horizontal-plane clear-sky value, so
-        dividing by I0_CLEAR (900 W) would give a falsely low scale.
-        Example: sensor=715 W, clear_sky_model=572 W → scale=1.25, not 0.78.
-        """
-        ratios = []
-        for dt, h in hours.items():
-            irr_meas = h.get(IRR_S)
-            if irr_meas is None or irr_meas < 10:
-                continue
-            cs = _clear_sky_w(dt.date())[dt.hour]
-            if cs < 200:
-                continue   # skip night / low-sun hours
-            ratios.append(irr_meas / cs)
-
-        if len(ratios) < 5:
-            return IRR_SCALE_DEF
-        ratios.sort()
-        idx = max(0, int(len(ratios) * 0.90) - 1)
-        return max(0.05, min(ratios[idx], 2.5))
-
     # ── Publish / helpers ─────────────────────────────────────────────────────
 
     def _publish(self, attrs):
@@ -727,17 +771,28 @@ class EmsCalibration(hass.Hass):
         )
 
     def _defaults_thermal(self, t_sp):
+        """Defaults for k, temp_bias, irr_bias.  COP handled by _defaults_cop."""
         return {
             "k": K_DEF,           "k_samples": 0,
-            "beta_irr": BETA_DEF or 0.000001, "beta_samples": 0,
-            "cop_a": COP_A_DEF,   "cop_b": COP_B_DEF, "cop_c": COP_C_DEF, "cop_samples": 0,
-            "irr_scale": IRR_SCALE_DEF,
-            "solar_scale": round(float(self.get_state(CALIB_ENTITY, attribute="solar_scale") or SOLAR_SCALE_DEF), 4),
             "temp_bias_a": TEMP_BIAS_A_DEF, "temp_bias_b": TEMP_BIAS_B_DEF, "temp_bias_n": 0,
-            "irr_bias_a":  IRR_BIAS_A_DEF,  "irr_bias_b":  IRR_BIAS_B_DEF,  "irr_bias_n": 0,
+            "irr_bias_a":  IRR_BIAS_A_DEF,  "irr_bias_n": 0,
             "t_setpoint": t_sp,   "source": "default",
             "days_used": CALIB_DAYS, "hours_processed": 0,
             "friendly_name": "Energy Calibration",
+        }
+
+    def _defaults_cop(self):
+        """
+        Fixed COP(T) = cop_a + cop_b·T coefficients from 365-day Blackbird analysis
+        (2025-04-16 – 2026-04-13, 2775 uren, R²=0.883, lineair).
+        cop_fit_date = today prevents _calibrate_cop from auto-overwriting on startup.
+        cop_c is omitted: ems_forecasts defaults to 0.0 when absent.
+        """
+        return {
+            "cop_a":        3.19,
+            "cop_b":        0.35,
+            "cop_samples":  2775,
+            "cop_fit_date": datetime.date.today().isoformat(),
         }
 
     def _defaults_energy(self):

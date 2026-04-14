@@ -30,7 +30,6 @@ full 36-hour window is rebuilt from fresh data.
 Update triggers
 ---------------
   sensor.nordpool_electricity_market_price  state or tomorrow_valid change → EPEX rebuild
-  weather.athome                            state change → weather forecasts rebuild
   sensor.energy_calibration                 new coefficients → weather forecasts rebuild
   Daily at 00:05                            new day → full rebuild
   Hourly at :00:05                          tick → advance state + trim past entries
@@ -46,17 +45,13 @@ from datetime import timedelta
 
 from ems_base import (
     NORDPOOL_ENTITY,
-    WEATHER_ENTITY,
     HP_SETPOINT_ENTITY,
     SOLAR_SENSORS_TODAY,
     SOLAR_SENSORS_TOMORROW,
     LATITUDE,
     LONGITUDE,
     nordpool_to_hourly,
-    solar_per_hour_irr,
     hp_slots_to_hourly,
-    irr_from_weather_forecast,
-    temp_from_weather_forecast,
     make_flat_forecast,
     forecast_window_stats,
 )
@@ -64,8 +59,6 @@ from ems_epex import enrich_hourly
 from ems_heating import (
     hp_hourly_forecast,
     K_DEFAULT,
-    BETA_DEFAULT,
-
 )
 
 CALIB_ENTITY = "sensor.energy_calibration"
@@ -87,11 +80,9 @@ class EmsForecasts(hass.Hass):
 
     def initialize(self):
         self._k           = K_DEFAULT
-        self._beta_w      = BETA_DEFAULT
         self._cop_a       = 3.5
         self._cop_b       = 0.08
         self._cop_c       = 0.0
-        self._irr_scale   = 1.0
         self._temp_bias_a = 1.0
         self._temp_bias_b = 0.0
         self._irr_bias_a  = 1.0
@@ -104,12 +95,11 @@ class EmsForecasts(hass.Hass):
         self.listen_state(self._on_nordpool, NORDPOOL_ENTITY)
         self.listen_state(self._on_nordpool, NORDPOOL_ENTITY,
                           attribute="tomorrow_valid")
-        self.listen_state(self._on_weather, WEATHER_ENTITY)
         self.listen_state(self._on_calib, CALIB_ENTITY)
 
         self.run_daily(self._on_new_day, "00:05:00")
         self.run_hourly(self._on_hour, "00:00:05")
-        self.run_in(self._on_startup, 15)
+        self.run_in(self._on_startup, 20)
 
     # ── Trigger handlers ──────────────────────────────────────────────────────
 
@@ -122,9 +112,6 @@ class EmsForecasts(hass.Hass):
     def _on_nordpool(self, entity, attribute, old, new, kwargs):
         self._build_epex_raw()
         self._refresh_epex()
-
-    def _on_weather(self, entity, attribute, old, new, kwargs):
-        self._publish_weather_forecasts(update_state=False)
 
     def _on_calib(self, entity, attribute, old, new, kwargs):
         self._load_calibration()
@@ -215,12 +202,10 @@ class EmsForecasts(hass.Hass):
                 return float(v) if v is not None else None
 
             if (v := _f("k"))           is not None: self._k           = v
-            if (v := _f("beta_irr"))    is not None: self._beta_w      = v
 
             if (v := _f("cop_a"))       is not None: self._cop_a       = v
             if (v := _f("cop_b"))       is not None: self._cop_b       = v
             if (v := _f("cop_c"))       is not None: self._cop_c       = v
-            if (v := _f("irr_scale"))   is not None: self._irr_scale   = v
             if (v := _f("temp_bias_a")) is not None: self._temp_bias_a = v
             if (v := _f("temp_bias_b")) is not None: self._temp_bias_b = v
             if (v := _f("irr_bias_a"))  is not None: self._irr_bias_a  = v
@@ -239,9 +224,7 @@ class EmsForecasts(hass.Hass):
             gamma_calibrated = sum(1 for v in self._gamma_h   if v > 0.01)
             self.log(
                 f"[EmsForecasts] Calibration loaded: k={self._k:.4f} "
-                f"beta={self._beta_w:.6f} "
                 f"cop={self._cop_a:.2f}+{self._cop_b:.3f}·T+{self._cop_c:.5f}·T² "
-                f"irr_scale={self._irr_scale:.3f} "
                 f"temp_bias={self._temp_bias_a:.3f}×+{self._temp_bias_b:.2f} "
                 f"irr_bias={self._irr_bias_a:.3f}×+{self._irr_bias_b:.1f} "
                 f"pv_eta={pv_calibrated}/24h "
@@ -468,24 +451,14 @@ class EmsForecasts(hass.Hass):
         start_dt = _dt.datetime(today.year, today.month, today.day, cur_h)
         n        = 36
 
-        scale    = float(self.get_state(CALIB_ENTITY, attribute="solar_scale") or 1.0)
         t_target = self._sensor_float(HP_SETPOINT_ENTITY, 20.5)
 
         # Open-Meteo: flat 48h arrays (index 0..23 = today, 24..47 = tomorrow)
         irr_48h, temp_48h = self._get_openmeteo_forecast(today, tomorrow)
         if irr_48h is None:
-            fc_entries = self._get_weather_entries()
-            irr_today  = irr_from_weather_forecast(fc_entries, today,
-                                                    scale=self._irr_scale)
-            irr_tom    = irr_from_weather_forecast(fc_entries, tomorrow,
-                                                    scale=self._irr_scale)
-            temp_today = temp_from_weather_forecast(fc_entries, today)
-            temp_tom   = temp_from_weather_forecast(fc_entries, tomorrow)
-            irr_48h    = irr_today + irr_tom
-            temp_48h   = temp_today + temp_tom
-            irr_source = "weather.athome"
-        else:
-            irr_source = "open-meteo"
+            self.log("[EmsForecasts] Open-Meteo unavailable — skipping weather forecast", level="WARNING")
+            return
+        irr_source = "open-meteo"
 
         # 36-hour windows from cur_h (may be shorter at late hours — irr_48h is 48h)
         irr_fc  = irr_48h[cur_h:cur_h + n]
@@ -504,8 +477,8 @@ class EmsForecasts(hass.Hass):
         past_irr_c  = [max(0.0, self._irr_bias_a * v + self._irr_bias_b) for v in past_irr]
         past_temp_c = [self._temp_bias_a * t + self._temp_bias_b for t in past_temp]
 
-        # PV: eta_h model when calibrated; fall back to solar_per_hour_irr
-        # pv_eta stored ×1000 for readability; divide back here
+        # PV: eta_h model (pv_eta stored ×1000 for readability; divide back here)
+        # Falls back to zero when not yet calibrated (conservative).
         if any(v > 0.01 for v in self._pv_eta):
             pv_fc = [
                 round(max(0.0, irr_fc_c[i] * self._pv_eta[(cur_h + i) % 24] / 1000), 4)
@@ -517,13 +490,9 @@ class EmsForecasts(hass.Hass):
             ]
             pv_source = "eta"
         else:
-            solar_today = sum(self._sensor_float(s) for s in SOLAR_SENSORS_TODAY)
-            solar_tom   = sum(self._sensor_float(s) for s in SOLAR_SENSORS_TOMORROW)
-            pv_today    = solar_per_hour_irr(solar_today, irr_48h[:24], scale)
-            pv_tom      = solar_per_hour_irr(solar_tom,   irr_48h[24:48], scale)
-            pv_fc       = (pv_today + pv_tom)[cur_h:cur_h + n]
-            past_pv     = (pv_today + pv_tom)[cur_h - n_past:cur_h]
-            pv_source   = "irr_scale"
+            pv_fc     = [0.0] * n
+            past_pv   = [0.0] * n_past
+            pv_source = "default"
 
         # Solar gain: gamma_h[hour] × irr / 1000  (gamma_h stored ×1000 for readability)
         # gamma_h implicitly encodes window orientation, incidence angle, shading.
@@ -546,13 +515,11 @@ class EmsForecasts(hass.Hass):
 
         # HP: flat forecast with COP / thermal breakdown
         hp_elec, cop_fc, th_demand_fc, th_solar_fc = hp_hourly_forecast(
-            self._k, self._beta_w,
-            self._cop_a, self._cop_b, self._cop_c,
+            self._k, self._cop_a, self._cop_b, self._cop_c,
             t_target, temp_fc_c, solar_gain_nh=solar_gain_nh,
         )
         past_hp, _, past_th_demand, past_th_solar = hp_hourly_forecast(
-            self._k, self._beta_w,
-            self._cop_a, self._cop_b, self._cop_c,
+            self._k, self._cop_a, self._cop_b, self._cop_c,
             t_target, past_temp_c, solar_gain_nh=past_gain,
         )
 
@@ -738,66 +705,6 @@ class EmsForecasts(hass.Hass):
         except Exception as exc:
             self.log(f"[EmsForecasts] Open-Meteo failed: {exc}", level="WARNING")
             return None, None
-
-    def _get_weather_entries(self):
-        """Fetch hourly weather forecast from weather.athome."""
-        token = os.environ.get("SUPERVISOR_TOKEN", "")
-        if token:
-            try:
-                resp = _requests.post(
-                    "http://supervisor/core/api/services/weather/get_forecasts"
-                    "?return_response",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"entity_id": WEATHER_ENTITY, "type": "hourly"},
-                    timeout=10,
-                )
-                if resp.ok:
-                    body    = resp.json()
-                    entries = (
-                        body.get("service_response", {})
-                            .get(WEATHER_ENTITY, {})
-                            .get("forecast", [])
-                        if isinstance(body, dict) else []
-                    )
-                    if entries:
-                        return entries
-            except Exception as exc:
-                self.log(
-                    f"[EmsForecasts] REST weather/get_forecasts failed: {exc}",
-                    level="WARNING",
-                )
-
-        try:
-            result  = self.call_service(
-                "weather/get_forecasts",
-                entity_id=WEATHER_ENTITY,
-                type="hourly",
-                return_response=True,
-            )
-            entries = (result or {}).get(WEATHER_ENTITY, {}).get("forecast", [])
-            if entries:
-                return entries
-        except Exception as exc:
-            self.log(
-                f"[EmsForecasts] weather/get_forecasts failed: {exc}",
-                level="WARNING",
-            )
-
-        try:
-            entries = self.get_state(WEATHER_ENTITY, attribute="forecast")
-            if entries:
-                return entries
-        except Exception:
-            pass
-
-        self.log(
-            "[EmsForecasts] No weather forecast available, using defaults",
-            level="WARNING",
-        )
-        return []
 
     def _sensor_float(self, entity_id, default=0.0):
         try:

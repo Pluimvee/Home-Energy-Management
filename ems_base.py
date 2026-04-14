@@ -58,10 +58,6 @@ IRRADIANCE_SENSOR = "sensor.irradiance"
 
 HP_SETPOINT_ENTITY = "number.smartcontrol_target"
 
-# ── Weather entity (source of hourly temperature + condition forecast) ─────────
-
-WEATHER_ENTITY = "weather.athome"
-
 # ── Location (for Open-Meteo irradiance forecast) ─────────────────────────────
 
 LATITUDE  = 52.488441   # degrees north
@@ -75,27 +71,6 @@ WINDOW_PANELS = [
     (90, 126),   # Achterpui – SE-facing
     (90, 216),   # Zijpui    – SSW-facing
 ]
-
-
-# ── Solar / weather constants ─────────────────────────────────────────────────
-
-I0_CLEAR             = 900.0   # W/m², peak clear-sky irradiance at sea level
-CLOUD_FACTOR_DEFAULT = 0.20
-
-CLOUD_FACTOR = {
-    "sunny":           0.90,
-    "partlycloudy":    0.55,
-    "cloudy":          0.20,
-    "rainy":           0.08,
-    "pouring":         0.05,
-    "snowy":           0.10,
-    "fog":             0.10,
-    "windy":           0.75,
-    "hail":            0.05,
-    "lightning":       0.05,
-    "lightning-rainy": 0.05,
-    "exceptional":     0.15,
-}
 
 
 # ── Nordpool conversion ───────────────────────────────────────────────────────
@@ -199,52 +174,6 @@ def current_hour_value(entries_today, hour):
     return entries_today[h].get("value", 0.0)
 
 
-# ── Solar distribution ────────────────────────────────────────────────────────
-
-_SOLAR_RISE = 6.0    # approximate sunrise (local hours)
-_SOLAR_SET  = 20.5   # approximate sunset  (local hours)
-
-_SOLAR_WEIGHTS = [
-    max(0.0, math.sin(math.pi * (h - _SOLAR_RISE) / (_SOLAR_SET - _SOLAR_RISE)))
-    if _SOLAR_RISE <= h < _SOLAR_SET else 0.0
-    for h in range(24)
-]
-_SOLAR_WEIGHT_SUM = sum(_SOLAR_WEIGHTS) or 1.0
-
-
-def solar_per_hour(total_kwh, scale=1.0):
-    """
-    Distribute a daily solar total (kWh) over 24 hourly kWh/h values
-    using a sine-shaped daylight curve between SOLAR_RISE and SOLAR_SET.
-
-    Parameters
-    ----------
-    total_kwh : float   daily production forecast (kWh)
-    scale     : float   correction factor (input_number.solar_scale_factor)
-    """
-    kwh = total_kwh * scale
-    return [round(w / _SOLAR_WEIGHT_SUM * kwh, 3) for w in _SOLAR_WEIGHTS]
-
-
-def solar_per_hour_irr(total_kwh, irr_24h, scale=1.0):
-    """
-    Distribute a daily solar total proportional to hourly irradiance,
-    so cloudy hours get less PV and sunny hours get more.
-
-    Falls back to sine distribution when the irradiance sum is < 1 W
-    (e.g. night-only data or missing forecast).
-
-    Parameters
-    ----------
-    total_kwh : float        daily production forecast (kWh)
-    irr_24h   : list[float]  24 hourly irradiance values (W)
-    scale     : float        correction factor
-    """
-    kwh     = total_kwh * scale
-    irr_sum = sum(irr_24h)
-    if irr_sum < 1.0:
-        return solar_per_hour(total_kwh, scale)
-    return [round(irr / irr_sum * kwh, 3) for irr in irr_24h]
 
 
 # ── Household energy component sensors ───────────────────────────────────────
@@ -262,7 +191,7 @@ def solar_per_hour_irr(total_kwh, irr_24h, scale=1.0):
 #
 HH_ENERGY_SOURCES = [
     # ── Sources (net grid import + all PV produced) ───────────────────────────
-    ("sensor.ecogrid_connect_electricity_consumed",        +1),  # grid import (kWh)
+    ("sensor.p1_meter_electricity_consumed",               +1),  # grid import (kWh)
     ("sensor.pv_total_energy",                             +1),  # total PV production (kWh)
     ("sensor.solis_s6_eh3p_total_energy_consumption",      +1),  # inverter DC load (kWh)
     # ── Sub-metered loads (remove from household) ─────────────────────────────
@@ -314,25 +243,6 @@ def parse_utc_dt(s):
             dt     = _dt.datetime.fromisoformat(s[:i])
             return dt - _dt.timedelta(hours=sign * offset)
     return _dt.datetime.fromisoformat(s[:19])
-
-
-# ── Astronomical helpers ──────────────────────────────────────────────────────
-
-def clear_sky_w(date, lat_deg=LATITUDE):
-    """
-    24-element list of clear-sky irradiance (W) for each hour of *date*.
-    Uses standard solar elevation formula (day-of-year + latitude).
-    """
-    lat  = math.radians(lat_deg)
-    doy  = date.timetuple().tm_yday
-    decl = math.radians(23.45 * math.sin(math.radians(360 / 365 * (doy - 80))))
-    result = []
-    for h in range(24):
-        hour_angle = math.radians(15 * (h - 12))
-        sin_elev   = (math.sin(lat) * math.sin(decl)
-                      + math.cos(lat) * math.cos(decl) * math.cos(hour_angle))
-        result.append(round(max(0.0, I0_CLEAR * sin_elev), 1))
-    return result
 
 
 # ── Irradiance transposition (POA model) ─────────────────────────────────────
@@ -424,8 +334,7 @@ def ghi_to_dni_dhi(ghi_nh, start_dt, lat_deg=LATITUDE):
     """
     Estimate DNI and DHI from GHI only using the Erbs decomposition model.
 
-    Used as a fallback when Open-Meteo DNI/DHI data is unavailable (e.g. when
-    falling back to weather.athome as the irradiance source).
+    Used as a fallback when Open-Meteo DNI/DHI data is unavailable.
 
     Parameters
     ----------
@@ -512,63 +421,6 @@ def panel_kwh_forecast(ghi_nh, dhi_nh, dni_nh, start_dt,
         poa    = irr_on_plane(dni, dhi, ghi, el, az, tilt_deg, az_panel_deg)
         result.append(round(poa * kwp / 1000.0, 4))
 
-    return result
-
-
-# ── Weather-based irradiance / temperature forecast ───────────────────────────
-
-def irr_from_weather_forecast(forecast_entries, target_date, lat_deg=LATITUDE,
-                               scale=1.0):
-    """
-    Build a 24-element hourly irradiance estimate (W) for *target_date* from
-    weather.athome hourly forecast entries.  Each entry must have 'datetime'
-    (ISO UTC string) and 'condition' keys.
-    """
-    tz_off   = ams_offset(target_date)
-    sky      = clear_sky_w(target_date, lat_deg)
-    cond_by_h = {}
-    for e in forecast_entries:
-        try:
-            dt_utc     = parse_utc_dt(e["datetime"])
-            local_date = (dt_utc + _dt.timedelta(hours=tz_off)).date()
-            if local_date == target_date:
-                local_h = (dt_utc.hour + tz_off) % 24
-                cond_by_h[local_h] = e.get("condition", "cloudy")
-        except Exception:
-            continue
-    return [
-        round(sky[h] * CLOUD_FACTOR.get(
-            cond_by_h.get(h, "cloudy"), CLOUD_FACTOR_DEFAULT) * scale, 1)
-        for h in range(24)
-    ]
-
-
-def temp_from_weather_forecast(forecast_entries, target_date):
-    """
-    Build a 24-element hourly temperature list (°C) for *target_date*.
-    Missing hours are filled with the nearest available value or 10 °C.
-    """
-    tz_off    = ams_offset(target_date)
-    temp_by_h = {}
-    for e in forecast_entries:
-        try:
-            dt_utc     = parse_utc_dt(e["datetime"])
-            local_date = (dt_utc + _dt.timedelta(hours=tz_off)).date()
-            if local_date == target_date and "temperature" in e:
-                local_h = (dt_utc.hour + tz_off) % 24
-                temp_by_h[local_h] = float(e["temperature"])
-        except Exception:
-            continue
-    if not temp_by_h:
-        return [10.0] * 24
-    all_h  = sorted(temp_by_h)
-    result = []
-    for h in range(24):
-        if h in temp_by_h:
-            result.append(temp_by_h[h])
-        else:
-            nearest = min(all_h, key=lambda x: abs(x - h))
-            result.append(temp_by_h[nearest])
     return result
 
 

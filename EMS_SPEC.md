@@ -64,54 +64,51 @@ Geldt voor **alle** forecasts:
 
 ## Batterij real-time aansturing (BatSim / ESPHome)
 
-De aansturing werkt op basis van twee parameters die elk uur door de strategy worden gepubliceerd:
-- `grid_target_w` — gewenste gridafname in W
-- `soc_target` — gewenste SOC in % aan het einde van het uur
+De controller krijgt elk uur twee parameters van de strategy:
+- `mode` — bepaalt welke richting is toegestaan
+- `target_grid_w` — setpoint voor de proportionele regelaar
 
-| Mode | Richting | Export | Doel | Gedrag als doel bereikt |
-|------|----------|--------|------|------------------------|
-| **level** | laden + ontladen | verboden | `grid_target_w` constant | Continu bijsturen (SOC 7–100%) |
-| **charge** | laden only | verboden | `soc_target` | Laden als `p1_w < target_grid` *(min afname; 0 = uit = anti-export)* |
-| **discharge** | ontladen only | verboden | `soc_target` | Ontladen als `p1_w > target_grid` *(max afname; 17000 = uit = altijd standby)* |
-| **export** | ontladen only | toegestaan | `soc_target` | Standby |
-| **hold** | geen | n.v.t. | — | Standby |
+| Mode | Richting | Gedrag |
+|------|----------|--------|
+| **charge** | laden only | integreer naar target_grid; force_discharge altijd uit |
+| **discharge** | ontladen only | integreer naar target_grid; force_charge altijd uit |
+| **hold** | geen | beide switches uit; requested_power = 0 |
 
-Tekenconventie batterijvermogen (P1 / ESPHome):
+Controller (proportioneel, per P1-event ~10s):
+- `charge`:    `requested_power -= GAIN_DOWN × (target_grid − grid_w)` ; cap ≤ 0
+- `discharge`: `requested_power += GAIN_UP   × (grid_w − target_grid)` ; cap ≥ 0
+- Mode-wissel reset `requested_power` naar 0 (geen integrator-overshoot)
+
+Tekenconventie:
 - `battery_w > 0` → ontladen (batterij levert, grid daalt)
 - `battery_w < 0` → laden (batterij neemt van grid, grid stijgt)
-- `grid_w = p1_clean − battery_w`
-
-Anti-export is altijd van toepassing behalve in `export` mode.
+- `grid_w = household_w − battery_w`
 
 ### Signaalschema
 
 ```
 ┌─────────────────┐   grid_w (10s)    ┌──────────────────────────────┐
 │  DSMR P1 meter  │ ────────────────→ │                              │
-└─────────────────┘                   │  ESPHome / BatSim            │
-                                      │                              │──→ Solis: mode + W
-┌─────────────────┐  mode             │  p1_estimate =               │
-│ sensor.strategy │  grid_target_w  → │  grid_w + battery_w_prev     │
-│    _battery     │  soc_target        │                              │
-└─────────────────┘  (elk uur)        │  battery_w = f(mode,         │
-                                      │    p1_est, target, soc)      │
+└─────────────────┘                   │  ESPHome / BatSim            │──→ Solis: mode + W
+                                      │                              │
+┌─────────────────┐  mode             │  battery_w =                 │
+│ sensor.strategy │  target_grid_w  → │    proportioneel(            │
+│    _battery     │  expected_soc     │    grid_w, target, mode)     │
+└─────────────────┘  (elk uur)        │                              │
+                                      │  SOC clamp: min 7% / max 100%│
 ┌─────────────────┐   SOC (10s)       │                              │
 │  Solis SOC      │ ────────────────→ │                              │
 └─────────────────┘                   └──────────────────────────────┘
 ```
 
-**Feedforward stabiliteit:** `p1_estimate = grid_w + battery_w_prev` annuleert de meetvertraging
-(max 10s) algebraïsch. De closed loop is stabiel ongeacht delay, zolang er geen stuurwijziging
-plaatsvindt binnen één sample. Tracking error bij lastsprong = maximaal één sample (10s).
-
 **BatSim vs. ESPHome productie:**
 
 | | BatSim (simulatie) | ESPHome (productie) |
 |---|---|---|
-| P1 input | `ecogrid_connect_power` | `ecogrid_connect_power` |
-| Huidige Solis aftrekken | Ja: `grid_w = ecogrid − solis_ac_grid_port` | Nee: ESPHome vervangt de huidige Solis-aansturing |
-| SOC input | `sensor.batsim_soc_pct` | Solis SOC sensor |
-| Output | `sensor.batsim_battery_w` (virtueel) | Solis charge/discharge commando + vermogen |
+| P1 input | `sensor.p1_reader_power` | `sensor.p1_reader_power` |
+| Huislast | `p1_reader + solis_ac_port` | n.v.t. — ESPHome vervangt Solis-aansturing |
+| SOC input | `sensor.batsim_soc_pct` | `sensor.solis_s6_eh3p_battery_soc` |
+| Output | `input_boolean/number.batsim_*` | `switch/number.solis_s6_eh3p_rc_force_*` |
 
 ---
 
@@ -126,46 +123,102 @@ plaatsvindt binnen één sample. Tracking error bij lastsprong = maximaal één 
 | Rendement | 97% (roundtrip) |
 | Min SOC | 7% |
 | Max SOC | 100% |
-| Min laad/ontlaadvermogen | 100 W (dode zone BatSim) |
-| Max laad/ontlaadvermogen | 10.000 W |
+| Min vermogen | 100 W (dode zone) |
+| Max vermogen | 10.000 W |
 
 **Gepubliceerde attributen per uur** (in `forecast` lijst):
 
 | Attribuut | Betekenis |
 |---|---|
-| `mode` | charge / discharge / level / export / hold |
-| `grid_target_w` | Gewenste gridafname (W) — leidend in level/charge-default/discharge-default |
-| `soc_target` | Gewenste SOC (%) aan het einde van het uur — leidend in charge/discharge/export |
+| `mode` | `charge` / `discharge` / `hold` |
+| `target_grid_w` | Setpoint gridafname (W); negatief = export toegestaan |
+| `expected_soc` | Verwachte SOC (%) aan het **einde** van het uur |
 
 **Constanten**:
 
 | Constante | Waarde | Gebruik |
 |---|---|---|
-| `GRID_TARGET_CHARGE` | 200 W | Min gridafname in charge mode |
-| `GRID_TARGET_DISCH` | 2000 W | Max gridafname in discharge mode |
-| `GRID_TARGET_LEVEL` | 200 W | Target gridafname in level mode |
-| `TP_WEIGHT` | 3 | TP-uren krijgen 3× meer SOC-gain dan band-uren |
+| `GRID_MIN_W` | 100 W | Anti-export vloer; target bij hold/standby |
+| `GRID_EXPORT_LIMIT` | 5000 W | Max export (min target_grid = −5000 W) |
+| `TP_WEIGHT` | 3 | TP-uren krijgen 3× meer SOC-gain dan band-uren (tier 1) |
 
-**Logica per tier** (`soc_target` berekening):
+### Logica per tier
 
-| Tier | Label | Mode | soc_target |
-|------|-------|------|-----------|
-| 0 | `negative` | level (vroege uren) + charge (laatste 1–2 uur) | level: n.v.t.; charge: 100% gecapped op PV headroom |
-| 1 | `trough` | charge | 100% gecapped op PV headroom; gewogen: TP-uur krijgt 3× meer gain |
-| 2 | `dip` | charge | survival SOC (netto vraag tot volgende tier ≤ 1); gewogen verdeling |
-| 3 | `neutral` | level | n.v.t. (grid_target_w = 200 W) |
-| 4 | `crest` | discharge (pct ≥ 0.5) of level | soc − (soc − min_soc) × (pct − 0.5) × 2 |
-| 5 | `peak` | discharge (pct ≥ 0.5) | idem, aggressiever door hogere pct |
+De gewenste eind-SOC per uur is leidend. `target_grid_w` volgt daaruit:
+```
+delta_soc   = soc_end − soc_begin  (positief = laden, negatief = ontladen)
+battery_kw  = delta_soc / 100 × usable_kwh          (voor discharge: / efficiency)
+target_grid = net_kw × 1000 + battery_kw × 1000     (net = hh + hp + ev − pv)
+```
 
-**Discharge verdeling over niet-cheap blok**:
-- Doel: batterij op min_soc bij start van het volgende cheap segment
-- Natural consumption (level-uren) trekt de SOC al omlaag
-- Extra discharge verdeeld over discharge-uren gewogen naar `pct`
+**Tier 0 — `negative` — charge**
+- Eind-SOC: 100% in het laatste actieve laaduur
+- Vroege uren: wacht (anti-export, geen actief laden); target_grid = GRID_MIN_W
+- Actieve uren: laden naar ceiling; TP-uur als ankerpunt, anders laatste 1–2 uur
+- Ceiling: 100% (geen PV-headroom reductie bij tier 0/1)
+- target_grid = net_W + laadvermogen_W — negatief bij PV-surplus (batterij absorbeert PV én grid)
+- Start-SOC doel = 7%: dit wordt bereikt door de voorafgaande tier 4/5 drain (zie aldaar)
 
-**PV headroom (anti-export ceiling)**:
-- `soc_ceiling = max_soc − verwacht PV-surplus in niet-cheap uren na het segment`
-- `soc_final = max(survival_soc, min(raw_target, soc_ceiling))`
-- Voorkomt dat volladen leidt tot export als daarna PV-surplus verwacht wordt
+**Tier 1 — `trough` — charge**
+- Eind-SOC: 100%
+- SOC-gain gewogen over segment: TP-uur krijgt 3× gain t.o.v. omliggende band-uren
+- Ceiling: 100% (geen headroom reductie)
+- target_grid = net_W + laadvermogen_W; negatief bij PV-surplus
+
+**Tier 2 — `dip` — charge of discharge**
+- Per-uur survival check: survival_here = 7% + netto verbruik VANAF dit uur t/m het eerste toekomstige uur met pct < pct van dit uur (goedkopere laadfase); bij ontbrekende pct: gehele horizon
+- Ceiling: max_soc − verwacht PV-surplus na het segment (anti-export); begrenst survival_here
+- SOC ≥ survival_here → discharge op GRID_MIN_W (batterij levert netto verbruik van dit uur)
+- SOC < survival_here → charge naar survival_here
+- Hold bestaat niet meer; als geen lading nodig, wordt ontladen
+
+**Tier 3 — `neutral` — charge of discharge**
+- Drie gevallen op basis van netto load en pct:
+
+| Situatie | Mode | Eind-SOC | target_grid |
+|----------|------|----------|-------------|
+| net ≤ 0 (PV surplus) | charge | SOC + PV-absorptie × eff | GRID_MIN_W |
+| net > 0, pct < 0.5 | charge | ongewijzigd (anti-export) | GRID_MIN_W |
+| net > 0, pct ≥ 0.5 | discharge | ongewijzigd (SOC hold) | net × 1000 W |
+
+- Als tier 0 volgt: PV-winst in tier-3 charge uren telt mee in drain-berekening voor tier 4/5
+
+**Tier 4 — `crest` — discharge**
+- Normaal (geen tier 0 volgt): batterij levert alle netto consumptie
+  - Eind-SOC daalt met `net / usable × 100%` per uur
+  - target_grid = GRID_MIN_W (batterij levert alles)
+- Als tier 0 volgt (waterfall, zie onder):
+  - Eind-SOC doel = 7% aan het begin van tier 0
+  - target_grid kan negatief worden (export)
+- net ≤ 0: discharge mode, batterij standby; target_grid = GRID_MIN_W
+
+**Tier 5 — `peak` — discharge**
+- Identiek aan tier 4
+- Krijgt eerste prioriteit in de waterfall bij drain naar tier 0 → laagste (meest negatieve) target_grid
+
+### Drain-waterfall (alleen als tier 0 volgt)
+
+Doel: SOC = 7% aan het begin van het tier-0 segment.
+
+```
+soc_piek      = huidige SOC + verwachte PV-absorptie in tier-3 charge uren
+needed_kwh    = (soc_piek − 7%) × usable
+cons_kwh_t5   = Σ net_kw voor tier-5 discharge uren
+cons_kwh_t4   = Σ net_kw voor tier-4 discharge uren
+
+alloc_t5      = min(needed_kwh, cons_kwh_t5)
+alloc_t4      = min(needed_kwh − alloc_t5, cons_kwh_t4)
+export_t5     = max(0, needed_kwh − cons_kwh_t5 − cons_kwh_t4) / n_t5_uren
+export_t4     = restant / n_t4_uren  (als tier 5 onvoldoende)
+
+frac_t        = (alloc_t + export_t × n_t) / cons_kwh_t
+target_grid   = (1 − frac_t) × net × 1000  (negatief bij frac > 1)
+```
+
+**PV headroom (tier 2)**:
+- `ceiling = max_soc − verwacht PV-surplus in niet-cheap uren na het segment`
+- Voorkomt dat volladen bij tier 2 leidt tot export als daarna PV-surplus verwacht wordt
+- Niet van toepassing bij tier 0/1 (ceiling = 100%)
 
 ---
 

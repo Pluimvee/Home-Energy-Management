@@ -43,7 +43,7 @@ from ems_base import forecast_window_stats
 BAND_MAX = 0.15   # band fraction: band = amplitude × BAND_MAX × spread
                   # amplitude = abs(TP_score − nearest_opposing_TP_score)
                   # → narrow band for close TP pairs, wide for extreme pairs
-MIN_AMP  = 0.25   # TP must differ > 25 % of spread from nearest opposing TP
+MIN_AMP  = 0.20   # TP must differ > 20 % of spread from nearest opposing TP
 
 TROUGH_MAX = 0.20  # valley TP: score below this → trough, above → dip
 PEAK_MIN   = 0.80  # peak TP:   score above this → peak,   below → crest
@@ -161,7 +161,7 @@ def _detect_tps(analysis: list, spread: float) -> tuple:
         # Beide beschikbare zijden moeten > MIN_AMP zijn.
         # Een ontbrekende zijde (rand van het window) telt niet mee als blokkade.
         amps = [a for a in (amp_left, amp_right) if a is not None]
-        if not amps or min(amps) < MIN_AMP:
+        if not amps or max(amps) < MIN_AMP:
             is_tp[tp_i] = False;  tp_types[tp_i] = ""
         # Een lokaal maximum bij een negatieve prijs is ruis, geen strategische TP.
         # Alleen valley-TPs zijn zinvol in de negatieve zone (diepste punt).
@@ -193,6 +193,12 @@ def _expand_labels(analysis: list, is_tp: list, tp_types: list,
         tp_price = analysis[i]
         tp_label = _classify_label(tp_price, pcts[i], True, tp_types[i])
         labels[i] = tp_label
+
+        # Negatieve uren: label = price < 0, geen band-expansie nodig.
+        # Alle omliggende uren krijgen hun eigen label via de fallback hieronder.
+        if tp_label == "negative":
+            continue
+
         band = amplitudes[i] * BAND_MAX * spread
 
         j = i - 1
