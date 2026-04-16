@@ -157,14 +157,17 @@ class EmsForecasts(hass.Hass):
 
                 trimmed = [e for e in forecast if e.get("start", "") >= now_iso]
 
-                # Recompute window stats + pct after trimming
+                # Recompute window stats + pct after trimming. De analyse gebruikt
+                # conceptueel 5 past values + de overgebleven future entries,
+                # begrensd op 24 uur totaal.
                 vals_trimmed = [float(e.get("value", 0.0)) for e in trimmed]
                 stats, pcts  = forecast_window_stats(vals_trimmed)
                 for i, e in enumerate(trimmed):
                     e["pct"] = pcts[i]
 
+                analysis_n = min(24, len(trimmed) + 5)
                 attrs["forecast"]  = trimmed
-                attrs["horizon"]   = stats["horizon"]
+                attrs["analysis_n"]   = analysis_n
                 attrs["min"]          = stats["min"]
                 attrs["max"]          = stats["max"]
                 attrs["avg"]          = stats["avg"]
@@ -349,7 +352,7 @@ class EmsForecasts(hass.Hass):
 
             cur_val = float(entries[0]["value"]) or 0.0001
             attrs["forecast"]     = entries
-            attrs["horizon"]      = stats["horizon"]
+            attrs["analysis_n"]   = stats["horizon"]
             attrs["min"]          = stats["min"]
             attrs["max"]          = stats["max"]
             attrs["avg"]          = stats["avg"]
@@ -622,7 +625,7 @@ class EmsForecasts(hass.Hass):
             "unit_of_measurement": unit,
             "friendly_name":       name,
             "forecast":            entries,
-            "horizon":             stats["horizon"],
+            "analysis_n":          stats["horizon"],
             "min":                 stats["min"],
             "max":                 stats["max"],
             "avg":                 stats["avg"],

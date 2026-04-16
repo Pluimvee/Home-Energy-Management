@@ -174,34 +174,6 @@ def current_hour_value(entries_today, hour):
     return entries_today[h].get("value", 0.0)
 
 
-
-
-# ── Household energy component sensors ───────────────────────────────────────
-#
-# Each entry: (sensor_id, sign)
-#   +1  = the sensor adds to household consumption
-#   -1  = the sensor is a sub-metered load that must be subtracted
-#
-# Together they represent:
-#   hh[h] = Σ(sign × Δsensor[h])
-#
-# Used in:
-#   energy_calibration.py  – to derive per-hour-of-day medians (hh_h00..h23)
-#   energy_sensors.py      – to publish sensor.forecast_household_energy
-#
-HH_ENERGY_SOURCES = [
-    # ── Sources (net grid import + all PV produced) ───────────────────────────
-    ("sensor.p1_meter_electricity_consumed",               +1),  # grid import (kWh)
-    ("sensor.pv_total_energy",                             +1),  # total PV production (kWh)
-    ("sensor.solis_s6_eh3p_total_energy_consumption",      +1),  # inverter DC load (kWh)
-    # ── Sub-metered loads (remove from household) ─────────────────────────────
-    ("sensor.solis_s6_eh3p_total_battery_charge_energy",   -1),  # battery charge (kWh)
-    ("sensor.ev_charger_energy",                           -1),  # EV charger (kWh)
-    ("sensor.heatpump_energy",                             -1),  # heat pump compressor (kWh)
-    ("sensor.heatpump_control_energy",                     -1),  # HP controller + pump (kWh)
-    ("sensor.warmtepompboiler_energy",                     -1),  # heat-pump boiler (kWh)
-]
-
 # ── HP slot-to-hour conversion ────────────────────────────────────────────────
 
 def hp_slots_to_hourly(slots_96):

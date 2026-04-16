@@ -53,13 +53,12 @@ import datetime
 
 import appdaemon.plugins.hass.hassapi as hass
 
-from ems_base import (
-    HP_SETPOINT_ENTITY, HH_ENERGY_SOURCES,
-)
+from ems_base import HP_SETPOINT_ENTITY
 from ems_heating import (
     GAMMA_DEFAULT,
     history_to_hourly_mean as _h_mean,
     history_to_hourly_cumul_change as _h_delta,
+    history_to_hourly_cumul_signed_change as _h_delta_signed,
 )
 
 # ── Sensor IDs ────────────────────────────────────────────────────────────────
@@ -72,6 +71,7 @@ HP_POWER_S         = "sensor.heatpump_power"                   # W   electrical 
 HP_CH_MODE_S       = "binary_sensor.smartcontrol_ch_mode"      # on/off CH demand (binary)
 BLACKBIRD_OUTPUT_S = "sensor.blackbird_p80_heat_pump_output_power"  # W  manufacturer thermal
 BLACKBIRD_INPUT_S  = "sensor.blackbird_p80_heat_pump_input_power"   # W  manufacturer electrical
+HH_TOTAL_ENERGY_S  = "sensor.p1_reader_household_total_energy"      # kWh household total (sum→delta)
 T_OUT_S          = "sensor.outsidetemp_outside_temperature"    # °C  outdoor temp (mean)
 T_IN_S           = "sensor.smartcontrol_inside"                # °C  room temp (mean)
 IRR_S            = "sensor.irradiance"                         # W   irradiance (mean)
@@ -84,9 +84,13 @@ CALIB_ENTITY     = "sensor.energy_calibration"
 # Energy sensors that store a cumulative sum in long-term statistics.
 # Hourly deltas are computed from consecutive sum values.
 _ENERGY_SUM_SENSORS = (
-    {THERMAL_ENERGY_S, HP_ENERGY_S, HP_CTRL_ENERGY_S, PV_ENERGY_S}
-    | {s for s, _ in HH_ENERGY_SOURCES}
+    {THERMAL_ENERGY_S, HP_ENERGY_S, HP_CTRL_ENERGY_S, PV_ENERGY_S, HH_TOTAL_ENERGY_S}
 )
+
+# Cumulative sensors that may legitimately decrease between hours.
+_SIGNED_ENERGY_SENSORS = {
+    "sensor.p1_net_electricity_cumulative",
+}
 
 # Binary sensors: "on"/"off" states are converted to 1.0/0.0 before hourly mean.
 _BINARY_SENSORS = {HP_CH_MODE_S}
@@ -107,6 +111,7 @@ CALIB_DAYS              = 14    # days for k / bias / energy calibration
 CALIB_DAYS_COP_VALIDATE = 90    # days to cross-validate kamstrup vs Blackbird
 CALIB_DAYS_COP_FIT      = 365   # days for COP(T) long-term fit
 COP_FIT_VALID_DAYS      = 180   # only re-fit when older than this
+CALIB_RETAIN_DAYS       = 21    # keep previous calibration on startup while still recent
 HP_ACTIVE_W       = 200.0  # thermal W threshold above which HP is considered active
 HP_RUNNING_W      = 300.0  # W   min compressor input to count as "running" for COP fit
 IRR_ACTIVE_W      = 50.0   # irradiance W threshold (general: pv_eta, k exclusion)
@@ -143,11 +148,13 @@ PV_ETA_DEF       = 0.001     # ×1000 scaled unit (mWh/(W/m²·h)); sentinel for
 class EmsCalibration(hass.Hass):
 
     def initialize(self):
-        # Publish a clean full-defaults state immediately to wipe any stale attributes
-        # from previous schema versions (flat hh_hXX, pv_eta_hXX, scalar gamma, etc.).
+        # Keep the previous calibration on startup while it is still recent enough.
+        # This prevents forecast consumers from briefly falling back to full defaults
+        # during a restart before the fresh calibration callbacks have finished.
         t_sp = self._sensor_float(HP_SETPOINT_ENTITY, 20.5)
-        clean = {**self._defaults_thermal(t_sp), **self._defaults_cop(), **self._defaults_energy()}
-        self.set_state(CALIB_ENTITY, state="initializing", attributes=clean, replace=True)
+        if not self._has_recent_calibration():
+            clean = {**self._defaults_thermal(t_sp), **self._defaults_cop(), **self._defaults_energy()}
+            self.set_state(CALIB_ENTITY, state="initializing", attributes=clean, replace=True)
 
         self.run_in(self._calibrate_thermal, 30)
         self.run_in(self._calibrate_energy, 120)
@@ -210,9 +217,7 @@ class EmsCalibration(hass.Hass):
         end   = datetime.datetime.now(datetime.timezone.utc)
         start = end - datetime.timedelta(days=CALIB_DAYS)
 
-        _base = [T_IN_S, T_OUT_S, THERMAL_ENERGY_S, HP_ENERGY_S, IRR_S, PV_ENERGY_S]
-        _hh   = [s for s, _ in HH_ENERGY_SOURCES if s not in _base]
-        sensors = _base + _hh
+        sensors = [T_IN_S, T_OUT_S, THERMAL_ENERGY_S, HP_ENERGY_S, IRR_S, PV_ENERGY_S, HH_TOTAL_ENERGY_S]
         try:
             hours = self._fetch_and_align(start, end, sensors)
         except Exception as exc:
@@ -230,6 +235,26 @@ class EmsCalibration(hass.Hass):
         hh_baseline, n_hh_min, n_hh_max = self._fit_household_baseline(hours)
         pv_eta,      n_pv_min, n_pv_max = self._fit_pv_eta(hours)
         gamma_h, n_gamma_min, n_gamma_max = self._fit_gamma_h(hours, k)
+
+        prev_attrs = (self.get_state(CALIB_ENTITY, attribute="all") or {}).get("attributes") or {}
+        if n_hh_max < MIN_HH_SAMPLES:
+            hh_baseline = self._reuse_previous_curve(
+                prev_attrs.get("hh_base"),
+                hh_baseline,
+                lambda vals: any(abs(float(v) - HH_H_DEF) > 1e-6 for v in vals),
+            )
+        if n_pv_max < MIN_PV_ETA_SAMPLES:
+            pv_eta = self._reuse_previous_curve(
+                prev_attrs.get("pv_eta"),
+                pv_eta,
+                lambda vals: any(float(v) > 0.01 for v in vals),
+            )
+        if n_gamma_max < MIN_GAMMA_H_SAMPLES:
+            gamma_h = self._reuse_previous_curve(
+                prev_attrs.get("gamma_h"),
+                gamma_h,
+                lambda vals: any(float(v) > 0.01 for v in vals),
+            )
 
         self._publish({
             "gamma_h":      gamma_h,
@@ -281,6 +306,8 @@ class EmsCalibration(hass.Hass):
                     elif s.get("state") == "off":
                         s["state"] = "0.0"
                 hourly = _h_mean(states)
+            elif sensor_id in _SIGNED_ENERGY_SENSORS:
+                hourly = _h_delta_signed(states)
             elif sensor_id in _ENERGY_SUM_SENSORS:
                 hourly = _h_delta(states)
             else:
@@ -603,13 +630,15 @@ class EmsCalibration(hass.Hass):
         """
         Per-hour-of-day baseline household consumption (kWh/h).
 
-        For each calendar hour (0..23) collect all days where every
-        HH_ENERGY_SOURCES sensor has a valid delta value, compute:
-            hh[h] = Σ(sign × Δsensor[h])
+        For each calendar hour (0..23) collect all days where the household
+        total energy helper has a valid hourly delta:
+            hh[h] = Δsensor.p1_reader_household_total_energy[h]
         then take the median across 14 days.
 
         A per-hour model captures genuine load patterns (morning peak,
-        midday dip, evening peak) that a flat-rate EWMA misses.
+        midday dip, evening peak) that a flat-rate EWMA misses. To prevent
+        thin sample buckets from dominating the strategy, per-hour buckets are
+        first de-spiked with the same MAD filter used for gamma_h.
 
         Returns (values_24h, n_min, n_max):
             values_24h : list[float]  24 hourly kWh/h medians
@@ -618,20 +647,18 @@ class EmsCalibration(hass.Hass):
         """
         buckets = [[] for _ in range(24)]
         for dt, h in hours.items():
-            total = 0.0
-            for sensor_id, sign in HH_ENERGY_SOURCES:
-                # Cumulative sensors: no update in an hour means delta = 0 (device idle).
-                # Treat missing values as 0.0 rather than discarding the entire hour.
-                v = h.get(sensor_id, 0.0) or 0.0
-                total += sign * v
+            total = h.get(HH_TOTAL_ENERGY_S)
+            if total is None:
+                continue
             if total < 0.0:
                 continue   # physically impossible
             buckets[dt.hour].append(total)
 
         result = []
         for bucket in buckets:
-            if len(bucket) >= MIN_HH_SAMPLES:
-                result.append(round(max(0.0, statistics.median(bucket)), 3))
+            filtered = self._mad_filter(bucket)
+            if len(filtered) >= MIN_HH_SAMPLES:
+                result.append(round(max(0.0, statistics.median(filtered)), 3))
             else:
                 result.append(HH_H_DEF)
 
@@ -769,6 +796,51 @@ class EmsCalibration(hass.Hass):
             attributes=merged,
             replace=True,   # full replacement — prevents AppDaemon from merging old attrs back
         )
+
+    def _has_recent_calibration(self):
+        """
+        Reuse the existing calibration at startup while it is still usable.
+
+        We require:
+        - a parseable publish timestamp in the entity state
+        - a timestamp not older than CALIB_RETAIN_DAYS
+        - non-default household and PV calibration data
+        """
+        try:
+            cur = self.get_state(CALIB_ENTITY, attribute="all") or {}
+            state = cur.get("state")
+            attrs = cur.get("attributes") or {}
+            if not state:
+                return False
+
+            published_at = datetime.datetime.fromisoformat(str(state))
+            age = datetime.datetime.now() - published_at
+            if age > datetime.timedelta(days=CALIB_RETAIN_DAYS):
+                return False
+
+            hh_base = attrs.get("hh_base")
+            pv_eta = attrs.get("pv_eta")
+            if not (isinstance(hh_base, list) and len(hh_base) == 24):
+                return False
+            if not (isinstance(pv_eta, list) and len(pv_eta) == 24):
+                return False
+
+            hh_non_default = any(abs(float(v) - HH_H_DEF) > 1e-6 for v in hh_base)
+            pv_calibrated = any(float(v) > 0.01 for v in pv_eta)
+            return hh_non_default and pv_calibrated
+        except Exception:
+            return False
+
+    def _reuse_previous_curve(self, previous, current, is_usable):
+        """Keep the previous calibrated curve when the freshly computed one is unusable."""
+        try:
+            if isinstance(previous, list) and len(previous) == 24:
+                prev = [float(v) for v in previous]
+                if is_usable(prev):
+                    return prev
+        except Exception:
+            pass
+        return current
 
     def _defaults_thermal(self, t_sp):
         """Defaults for k, temp_bias, irr_bias.  COP handled by _defaults_cop."""

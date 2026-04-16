@@ -31,9 +31,9 @@ Geldt voor **alle** forecasts:
 |---|---|
 | Past values | 5 uren (uit HA recorder) |
 | Huidig uur | 1 |
-| Forecast | max 18 uren |
+| Forecast | huidig uur + max 18 uur vooruit |
 | **Totaal window** | **min 12 – max 24 uren** |
-| Berekende stats | `min`, `max`, `avg`, `median`, `horizon` |
+| Berekende stats | `min`, `max`, `avg`, `median`, `analysis_n` |
 | Per entry | `pct` = positie in [min–max] range, 0.001–1.0 |
 
 ---
@@ -57,7 +57,7 @@ Geldt voor **alle** forecasts:
 | 1 | `trough` | valley TP, pct < 0.20 | Charge naar 100% (TP-gewogen); gecapped op PV headroom |
 | 2 | `dip` | valley TP, pct ≥ 0.20 | Charge naar survival SOC (TP-gewogen) |
 | 3 | `neutral` | geen TP | Level (pct < 0.5) of discharge (pct ≥ 0.5) |
-| 4 | `crest` | peak TP, pct ≤ 0.80 | Discharge (pct-gewogen), level als pct < 0.5 |
+| 4 | `crest` | peak TP, pct ≤ 0.80 | Discharge (pct-gewogen) |
 | 5 | `peak` | peak TP, pct > 0.80 | Discharge (pct-gewogen) |
 
 ---
@@ -93,7 +93,7 @@ Tekenconventie:
                                       │                              │
 ┌─────────────────┐  mode             │  battery_w =                 │
 │ sensor.strategy │  target_grid_w  → │    proportioneel(            │
-│    _battery     │  expected_soc     │    grid_w, target, mode)     │
+│    _battery     │   target_soc      │    grid_w, target, mode)     │
 └─────────────────┘  (elk uur)        │                              │
                                       │  SOC clamp: min 7% / max 100%│
 ┌─────────────────┐   SOC (10s)       │                              │
@@ -123,7 +123,7 @@ Tekenconventie:
 | Rendement | 97% (roundtrip) |
 | Min SOC | 7% |
 | Max SOC | 100% |
-| Min vermogen | 100 W (dode zone) |
+| Min vermogen | 50 W (dode zone) |
 | Max vermogen | 10.000 W |
 
 **Gepubliceerde attributen per uur** (in `forecast` lijst):
@@ -132,13 +132,13 @@ Tekenconventie:
 |---|---|
 | `mode` | `charge` / `discharge` / `hold` |
 | `target_grid_w` | Setpoint gridafname (W); negatief = export toegestaan |
-| `expected_soc` | Verwachte SOC (%) aan het **einde** van het uur |
+| `target_soc` | Doel-SOC (%) aan het **einde** van het uur |
 
 **Constanten**:
 
 | Constante | Waarde | Gebruik |
 |---|---|---|
-| `GRID_MIN_W` | 100 W | Anti-export vloer; target bij hold/standby |
+| `GRID_MIN_W` | 50 W | Anti-export vloer; target bij hold/standby |
 | `GRID_EXPORT_LIMIT` | 5000 W | Max export (min target_grid = −5000 W) |
 | `TP_WEIGHT` | 3 | TP-uren krijgen 3× meer SOC-gain dan band-uren (tier 1) |
 
@@ -148,29 +148,33 @@ De gewenste eind-SOC per uur is leidend. `target_grid_w` volgt daaruit:
 ```
 delta_soc   = soc_end − soc_begin  (positief = laden, negatief = ontladen)
 battery_kw  = delta_soc / 100 × usable_kwh          (voor discharge: / efficiency)
-target_grid = net_kw × 1000 + battery_kw × 1000     (net = hh + hp + ev − pv)
+target_grid = net_kw × 1000 + battery_kw × 1000     (net = hh + hp − pv)
 ```
 
-**Tier 0 — `negative` — charge**
+**Tier 0 — `negative` — charge / level**
 - Eind-SOC: 100% in het laatste actieve laaduur
-- Vroege uren: wacht (anti-export, geen actief laden); target_grid = GRID_MIN_W
-- Actieve uren: laden naar ceiling; TP-uur als ankerpunt, anders laatste 1–2 uur
+- Niet-actieve uren binnen het segment: `level` op 0W
+- Actieve laaduren: `charge`; TP-uur als ankerpunt, daarna goedkoopste aangrenzende uur (bij gelijke prijs voorkeur voor later uur)
 - Ceiling: 100% (geen PV-headroom reductie bij tier 0/1)
 - target_grid = net_W + laadvermogen_W — negatief bij PV-surplus (batterij absorbeert PV én grid)
 - Start-SOC doel = 7%: dit wordt bereikt door de voorafgaande tier 4/5 drain (zie aldaar)
 
-**Tier 1 — `trough` — charge**
+**Tier 1 — `trough` — charge / level**
 - Eind-SOC: 100%
-- SOC-gain gewogen over segment: TP-uur krijgt 3× gain t.o.v. omliggende band-uren
+- Alleen uren die echt een SOC-stap dragen staan op `charge`
+- Als het TP-uur het segmentdoel alleen kan halen, staan de omliggende trough-uren op `level`
+- Als hulp nodig is, krijgt eerst het goedkoopste aangrenzende uur de SOC-gain; bij gelijke prijs het latere uur
 - Ceiling: 100% (geen headroom reductie)
 - target_grid = net_W + laadvermogen_W; negatief bij PV-surplus
 
 **Tier 2 — `dip` — charge of discharge**
-- Per-uur survival check: survival_here = 7% + netto verbruik VANAF dit uur t/m het eerste toekomstige uur met pct < pct van dit uur (goedkopere laadfase); bij ontbrekende pct: gehele horizon
-- Ceiling: max_soc − verwacht PV-surplus na het segment (anti-export); begrenst survival_here
-- SOC ≥ survival_here → discharge op GRID_MIN_W (batterij levert netto verbruik van dit uur)
-- SOC < survival_here → charge naar survival_here
-- Hold bestaat niet meer; als geen lading nodig, wordt ontladen
+- Per uur twee survival-groottes:
+  - `survival_start` = SOC nodig aan het BEGIN van dit uur om dit uur plus de resterende dip-uren te overleven tot het eerste toekomstige uur met `pct < pct_huidig` (goedkopere laadfase); bij ontbrekende pct: gehele horizon
+  - `survival_end` = SOC nodig aan het EINDE van dit uur om vanaf het volgende uur diezelfde goedkopere laadfase te halen
+- Ceiling: max_soc − verwacht PV-surplus na het segment (anti-export); begrenst beide survival-groottes
+- SOC ≥ `survival_start` → level op 0W (batterij volgt netto verbruik bidirectioneel)
+- SOC < `survival_start` → charge naar `survival_end`
+- Hold bestaat niet meer; als geen lading nodig, wordt `level`
 
 **Tier 3 — `neutral` — charge of discharge**
 - Drie gevallen op basis van netto load en pct:
@@ -186,11 +190,11 @@ target_grid = net_kw × 1000 + battery_kw × 1000     (net = hh + hp + ev − pv
 **Tier 4 — `crest` — discharge**
 - Normaal (geen tier 0 volgt): batterij levert alle netto consumptie
   - Eind-SOC daalt met `net / usable × 100%` per uur
-  - target_grid = GRID_MIN_W (batterij levert alles)
+  - target_grid = 0W
 - Als tier 0 volgt (waterfall, zie onder):
   - Eind-SOC doel = 7% aan het begin van tier 0
   - target_grid kan negatief worden (export)
-- net ≤ 0: discharge mode, batterij standby; target_grid = GRID_MIN_W
+- net ≤ 0: discharge mode, batterij standby; target_grid = 0W
 
 **Tier 5 — `peak` — discharge**
 - Identiek aan tier 4
@@ -242,6 +246,36 @@ target_grid   = (1 − frac_t) × net × 1000  (negatief bij frac > 1)
 | `slow` | 10A = 2.3 kW | Tier ≤ 1 (trough/negative), geen deadline → mag gesplitst over segmenten |
 | `fast` | 16A = 3.68 kW | Deadline ingesteld (`input_datetime.need_to_use_car`), goedkoopste uren vóór deadline |
 | `off` | – | Geen goedkoop uur of EV niet nodig |
+
+### EV en batterijplanning
+
+De EV-laadmode wordt **niet** meegenomen in de netto batterijforecast.
+
+Voor de batterijstrategie geldt nu:
+
+```text
+net = household + heatpump - pv
+```
+
+Dus expliciet:
+- **zonder EV charger**
+- **met** household forecast
+- **met** heatpump forecast
+- **minus** PV forecast
+
+Reden:
+- zonder EV-SOC of resterende laadbehoefte is `slow = 2.3 kW` / `fast = 3.68 kW` te grof
+- die aanname heeft te veel impact op de geplande batterij-SOC
+
+Runtime-aandachtspunt:
+- als EV-laden start terwijl de batterij in `charge` staat, stijgt alleen de gridimport; in een trough is dat acceptabel
+- als EV-laden start terwijl de batterij in `level` of `discharge` staat, compenseert de batterij dat extra verbruik en daalt de SOC sneller
+
+Dashboard-opmerking:
+- het dashboard berekent `net` zelfstandig en leest deze niet uit een strategy-sensor
+- aandachtspunt: als de nettoformule in code of dashboard wijzigt, moeten beide bewust gelijkgetrokken worden
+- een dashboard dat `net = household + hp + ev - pv` toont, loopt dus niet synchroon met de huidige strategy-code
+- voor vergelijking met de strategy moet EV dus uit die nettoformule blijven
 
 ---
 

@@ -29,11 +29,12 @@ EPEX analysis fields (pre-computed in sensor.forecast_epex by ems_forecasts)
 
 Battery strategy output (per uur)
 ----------------------------------
-  target_grid_w  Doelwaarde grid (W); negatief = export; controller stuurt hierop
-  expected_soc   Verwachte SOC aan einde van het uur (%, monitoring)
+  target_grid_w  Doelwaarde grid (W); negatief = export; leidend in discharge
+  target_soc     Doel-SOC aan einde van het uur (%); leidend in charge
 
 Controller (ems_bat_controller) logica:
   mode = charge    → laden als grid < target_grid_w, nooit ontladen
+  mode = level     → bidirectioneel sturen op target_grid_w
   mode = discharge → ontladen als grid > target_grid_w, nooit laden
   mode = hold      → doe niets
 
@@ -61,6 +62,7 @@ TP_WEIGHT           = 3     # TP-uren krijgen 3× meer SOC-gain dan band-uren bi
 # ── Target-grid constanten (strategy → controller) ────────────────────────────
 GRID_MIN_W        = 50    # W anti-export target in charge-mode standby
 GRID_EXPORT_LIMIT = 5000  # W max export bij pre-empty / surplus (negatieve target)
+POST_CHEAP_MARGIN_SOC = 5.0  # %-punt extra ruimte om met kleine forecastfouten toch ~100% te halen
 
 
 EV_SLOW_KW = 2.3   # 10 A × 230 V
@@ -88,6 +90,7 @@ class EmsStrategy(hass.Hass):
     def initialize(self):
         self.run_hourly(self.run_strategy, "00:00:30")
         self.run_every(self.run_strategy, self.datetime(), 15 * 60)
+        self.run_in(self.run_strategy, 1)
 
         # Herbereken direct als een van de onderliggende forecasts wijzigt
         for sensor in (
@@ -114,6 +117,10 @@ class EmsStrategy(hass.Hass):
         hp_fc      = self._read_forecast("sensor.forecast_heatpump")
         thermic_fc = self._read_forecast("sensor.forecast_thermic")
         hh_fc      = self._read_forecast("sensor.forecast_household_energy")
+        epex_analysis_n = self._read_analysis_n("sensor.forecast_epex")
+        pv_analysis_n   = self._read_analysis_n("sensor.forecast_pv")
+        hp_analysis_n   = self._read_analysis_n("sensor.forecast_heatpump")
+        hh_analysis_n   = self._read_analysis_n("sensor.forecast_household_energy")
 
         if not epex_fc:
             self.log("[Strategy] sensor.forecast_epex has no entries", level="WARNING")
@@ -138,9 +145,15 @@ class EmsStrategy(hass.Hass):
         solar_gain  = _align_attr(thermic_fc,  ref, "solar_gain", default=0.0)
 
         # ── Per-hour strategy decisions ───────────────────────────────────────
-        horizons = [_forecast_horizon(fc, ref) or n
-                    for fc in (epex_fc, pv_fc, hp_fc, hh_fc)]
-        n_bat    = max(1, min(horizons))
+        overlap_horizons = [_forecast_horizon(fc, ref) or n
+                            for fc in (epex_fc, pv_fc, hp_fc, hh_fc)]
+        analysis_horizons = [
+            max(1, epex_analysis_n - 5) if epex_analysis_n is not None else n,
+            max(1, pv_analysis_n   - 5) if pv_analysis_n   is not None else n,
+            max(1, hp_analysis_n   - 5) if hp_analysis_n   is not None else n,
+            max(1, hh_analysis_n   - 5) if hh_analysis_n   is not None else n,
+        ]
+        n_bat    = max(1, min(min(overlap_horizons), min(analysis_horizons)))
         analysis = ref[:n_bat]
 
         peaks   = sorted([h for h in ref if h.get("is_tp") and h.get("label") == "peak"],
@@ -149,14 +162,9 @@ class EmsStrategy(hass.Hass):
                          key=lambda x:  x.get("pct", 1))[:MAX_TROUGHS]
 
         ev_decisions = ev_strategy(analysis[:n_bat], hours_to_need, ev_capacity_kwh)
-        ev_kw_bat = [
-            EV_FAST_KW if d["mode"] == "fast" else
-            EV_SLOW_KW if d["mode"] == "slow" else 0.0
-            for d in ev_decisions
-        ]
 
         bat_decisions = battery_strategy(
-            pv_h[:n_bat], hp_h[:n_bat], hh_h[:n_bat], ev_kw_bat,
+            pv_h[:n_bat], hp_h[:n_bat], hh_h[:n_bat],
             analysis[:n_bat], soc,
             BATTERY_MIN_SOC, BATTERY_MAX_SOC,
             BATTERY_CAPACITY_KWH, BATTERY_USABLE,
@@ -180,13 +188,14 @@ class EmsStrategy(hass.Hass):
             state=cur["mode"],
             attributes={
                 "friendly_name":  "Batterij strategie",
-                "target_grid_w":  cur["target_grid_w"],
-                "expected_soc":   cur["expected_soc"],
+                "target_grid_w":  str(cur["target_grid_w"]),
+                "target_soc":     cur["target_soc"],
                 "soc_pct":        round(soc, 1),
                 "forecast":       _make_forecast(bat_decisions, starts,
-                                      ["target_grid_w", "expected_soc"]),
+                                      ["target_grid_w", "target_soc"]),
                 "last_updated":   now.isoformat(),
             },
+            replace=True,
         )
 
         self.set_state(
@@ -226,7 +235,7 @@ class EmsStrategy(hass.Hass):
         self.log(
             f"[Strategy] bat={cur['mode']}"
             f" target={cur['target_grid_w']}W"
-            f" exp_soc={cur['expected_soc']:.0f}%"
+            f" target_soc={cur['target_soc']:.0f}%"
             f" ev={ev_decisions[0]['mode']}"
             f" hp={hp_decisions[0]['mode']}"
             f" wpb={wpb_decisions[0]['mode']}"
@@ -243,6 +252,15 @@ class EmsStrategy(hass.Hass):
             return fc if isinstance(fc, list) else []
         except Exception:
             return []
+
+    def _read_analysis_n(self, sensor_id):
+        try:
+            value = self.get_state(sensor_id, attribute="analysis_n")
+            if value in (None, "", "unknown", "unavailable"):
+                return None
+            return int(float(value))
+        except Exception:
+            return None
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
@@ -277,8 +295,11 @@ def _make_forecast(decisions, starts, extra_keys):
     for i in range(len(decisions)):
         entry = {"start": starts[i] if i < len(starts) else "", "mode": decisions[i]["mode"]}
         for k in extra_keys:
-            if k in decisions[i]:
-                entry[k] = decisions[i][k]
+            value = decisions[i].get(k)
+            if k == "target_grid_w" and value is not None:
+                entry[k] = str(value)
+            else:
+                entry[k] = value
         result.append(entry)
     return result
 
@@ -299,14 +320,14 @@ def _hours_to_ev_need(raw_state, now):
 
 # ── Pure strategy functions ───────────────────────────────────────────────────
 
-def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
+def battery_strategy(pv, hp, hh, analysis, soc_now,
                      min_soc, max_soc, capacity_kwh, usable_ratio,
                      min_kw, max_kw, efficiency,
                      tp_weight=TP_WEIGHT):
     """
     Grid-band battery strategy per uur.
 
-    Output per uur: {mode, target_grid_w, expected_soc}
+    Output per uur: {mode, target_grid_w, target_soc}
 
     Controllerlogica (in ems_bat_controller):
       mode = charge    → laden als grid < target_grid_w, nooit ontladen
@@ -317,7 +338,10 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
       charge (tier ≤ 2):
         target_grid_w = forecast_huislast_w + benodigd_laadvermogen_w
         (standby / anti-export: target_grid_w = GRID_MIN_W = 100W)
-      discharge (niet-goedkoop, verbruiksuur) — tier-waterfall:
+      level (tier 3 / neutral):
+        target_grid_w = GRID_MIN_W
+        batterij stuurt bidirectioneel rond target_grid_w
+      discharge (tier 4/5) — tier-waterfall:
         Beschikbare kWh = (SOC − min_soc) / 100 × usable
         Verdeling: tier 5 krijgt eerst, dan 4, dan 3.
           fraction_t    = alloc_t / cons_t  (0..1)
@@ -334,7 +358,7 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
     n      = len(analysis)
     usable = capacity_kwh * usable_ratio
 
-    net_kw_arr = [hh[i] + hp[i] + ev_kw[i] - pv[i] for i in range(n)]
+    net_kw_arr = [hh[i] + hp[i] - pv[i] for i in range(n)]
     _LABEL_TIER = {"negative": 0, "trough": 1, "dip": 2, "neutral": 3, "crest": 4, "peak": 5}
     tiers     = [int(h["tier"]) if "tier" in h and h["tier"] != "" else
                  _LABEL_TIER.get(h.get("label", "neutral"), 3)
@@ -384,6 +408,93 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
             surplus_kwh += max(0.0, -(net_kw_arr[k]))
         return max(min_soc, max_soc - _kwh_to_soc(surplus_kwh))
 
+    def _post_segment_surplus_soc(seg_end):
+        """
+        Verwachte surplus-SOC in de niet-goedkope uren direct na een cheap segment.
+
+        Dit gebruiken we om trough/negative segmenten niet onnodig tot 100% te vullen
+        wanneer kort daarna gratis PV de batterij ook nog kan laden.
+        """
+        surplus_kwh = 0.0
+        for k in range(seg_end, n):
+            if tiers[k] <= 2:
+                break
+            surplus_kwh += max(0.0, -(net_kw_arr[k]))
+        return _kwh_to_soc(surplus_kwh)
+
+    def _cheap_tail_surplus_soc(seg_hours):
+        """
+        Verwachte surplus-SOC in de resterende uren van hetzelfde cheap segment,
+        ná het TP-anker.
+
+        Zonder deze correctie kan een trough-segment in het TP-uur al naar 100%
+        worden getrokken, terwijl een later cheap uur in hetzelfde segment nog
+        gratis PV-surplus heeft dat de batterij vanzelf zou vullen.
+        """
+        anchor_hour = next((k for k in seg_hours if is_tp_arr[k]), None)
+        if anchor_hour is None:
+            anchor_hour = min(
+                seg_hours,
+                key=lambda k: analysis[k].get("pct", 1.0) if analysis[k].get("pct") is not None else 1.0,
+            )
+
+        surplus_kwh = 0.0
+        for k in seg_hours:
+            if k <= anchor_hour:
+                continue
+            surplus_kwh += max(0.0, -(net_kw_arr[k]))
+        return _kwh_to_soc(surplus_kwh)
+
+    def _tp_centered_order(seg_hours):
+        """
+        Verdeel lading vanuit het TP-uur naar buiten.
+
+        Eerst het TP zelf. Als extra uren nodig zijn, kies dan eerst het
+        goedkoopste aangrenzende uur; bij gelijke prijs krijgt het latere uur
+        voorrang. Pas daarna wordt verder naar buiten uitgewaaierd.
+        """
+        anchor_hour = next((k for k in seg_hours if is_tp_arr[k]), None)
+        if anchor_hour is None:
+            anchor_hour = min(
+                seg_hours,
+                key=lambda k: analysis[k].get("pct", 1.0) if analysis[k].get("pct") is not None else 1.0,
+            )
+
+        anchor_idx = seg_hours.index(anchor_hour)
+        order = [anchor_idx]
+        remaining = set(range(len(seg_hours)))
+        remaining.remove(anchor_idx)
+        while remaining:
+            candidates = []
+            for idx in sorted(remaining):
+                dist = abs(idx - anchor_idx)
+                pct = analysis[seg_hours[idx]].get("pct")
+                pct = 1.0 if pct is None else pct
+                # Bij gelijke prijs: geef voorkeur aan het latere uur.
+                later_bias = 0 if idx > anchor_idx else 1
+                candidates.append((dist, pct, later_bias, idx))
+            _, _, _, chosen = min(candidates)
+            order.append(chosen)
+            remaining.remove(chosen)
+        return order
+
+    def _segment_soc_gains(seg_hours, soc_start, soc_final):
+        """
+        Verdeel de benodigde SOC-gain over het segment vanuit het TP naar buiten.
+        Elk uur heeft een maximaal haalbare SOC-stijging op basis van BATTERY_MAX_KW.
+        """
+        max_soc_gain_per_h = max_kw * efficiency / usable * 100.0
+        gains = [0.0] * len(seg_hours)
+        remaining = max(0.0, soc_final - soc_start)
+
+        for idx in _tp_centered_order(seg_hours):
+            gain = min(max_soc_gain_per_h, remaining)
+            gains[idx] = gain
+            remaining -= gain
+            if remaining <= 1e-6:
+                break
+        return gains
+
     def _charge_min_grid(soc_gain, net_w):
         """
         target_grid_w voor actief laden (charge mode).
@@ -399,7 +510,6 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
             return GRID_MIN_W   # al op target: alleen anti-export, geen grid forcing
         rate_w = soc_gain / 100.0 * usable * 1000.0 / efficiency
         return round(net_w + rate_w)  # mag negatief zijn bij PV-surplus
-
 
     decisions = []
     soc = soc_now
@@ -426,88 +536,58 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
             )
             survival = _survival_soc_from(j, seg_tp_pct)
 
-            if seg_min_tier == 0:
-                # Tier 0: wacht-uren eerst, daarna actief laden naar ceiling
-                import math
-                max_soc_gain_per_h = max_kw * efficiency / usable * 100.0
-                n_charge_end = min(2, max(1, math.ceil((max_soc - soc) / max_soc_gain_per_h)))
-                n_charge_end = min(n_charge_end, len(seg_hours))
-
-                tp_idx_in_seg = None
-                for idx, k in enumerate(seg_hours):
-                    if is_tp_arr[k]:
-                        tp_idx_in_seg = idx
-                        break
-
-                charge_start = tp_idx_in_seg if tp_idx_in_seg is not None \
-                               else len(seg_hours) - n_charge_end
+            if seg_min_tier <= 1:
+                # Tier 0/1: charge-georiënteerd, maar verdeel actief laden vanuit
+                # het TP-uur naar buiten. Zo wordt het prijsminimum maximaal benut
+                # en vullen omliggende uren alleen aan als dat nodig is.
+                future_surplus_soc = (
+                    _cheap_tail_surplus_soc(seg_hours)
+                    + _post_segment_surplus_soc(j)
+                )
+                raw_target = min(max_soc, max_soc + POST_CHEAP_MARGIN_SOC - future_surplus_soc)
+                soc_final  = max(soc, min(raw_target, ceiling))
+                gains = _segment_soc_gains(seg_hours, soc, soc_final)
 
                 for idx, k in enumerate(seg_hours):
-                    soc_before = soc
                     net_w      = net_kw_arr[k] * 1000
-                    if idx < charge_start:
-                        # Wacht: anti-export target; batterij absorbeert eventueel PV-surplus
-                        target_w = GRID_MIN_W
-                    else:
-                        remaining  = len(seg_hours) - idx
-                        gain_per_h = max(0.0, (ceiling - soc) / remaining)
-                        soc        = min(max_soc, soc + gain_per_h)
-                        target_w   = _charge_min_grid(soc - soc_before, net_w)
-                    decisions.append({
-                        "mode":           "charge",
-                        "target_grid_w":  target_w,
-                        "expected_soc":   round(soc, 1),
-                    })
-
-            elif seg_min_tier <= 1:
-                # Trough (tier 1): charge naar ceiling, SOC-gain TP-gewogen.
-                raw_target = max_soc
-                soc_final  = max(survival, min(raw_target, ceiling))
-                total_gain = max(0.0, soc_final - soc)
-                tp_set     = {k for k in seg_hours if is_tp_arr[k]}
-                n_tp_s     = len(tp_set)
-                n_band_s   = len(seg_hours) - n_tp_s
-                total_w    = n_tp_s * tp_weight + n_band_s
-                gain_unit  = total_gain / total_w if total_w > 0 else 0.0
-
-                for k in seg_hours:
-                    soc_before = soc
-                    net_w      = net_kw_arr[k] * 1000
-                    w          = tp_weight if k in tp_set else 1
-                    soc        = min(max_soc, soc + gain_unit * w)
-                    gain       = soc - soc_before
+                    gain       = gains[idx]
                     if gain > 0:
-                        mode     = "charge"
+                        soc      = min(max_soc, soc + gain)
                         target_w = _charge_min_grid(gain, net_w)
+                        mode     = "charge"
                     else:
-                        mode     = "hold"
-                        target_w = GRID_MIN_W
+                        target_w = 0
+                        mode     = "level"
                     decisions.append({
                         "mode":           mode,
                         "target_grid_w":  target_w,
-                        "expected_soc":   round(soc, 1),
+                        "target_soc":     round(soc, 1),
                     })
 
             else:
                 # Tier 2 (dip): per-uur survival check.
-                # survival_here berekend INCLUSIEF het huidige uur én resterende dip-uren
-                # (niet alleen na het segment). Dit geeft de juiste bodem voor de SOC.
-                # Boven survival → discharge op MIN_GRID (geen hold).
-                # Onder survival → charge naar survival_here.
+                # Beslisdrempel: SOC nodig AAN HET BEGIN van dit uur om dit uur én
+                # de resterende dip-uren te overleven tot een goedkopere laadfase.
+                # Charge-doel: SOC nodig AAN HET EINDE van dit uur om vanaf het
+                # volgende uur diezelfde goedkopere laadfase te halen.
+                # Boven begin-drempel → level op MIN_GRID.
+                # Onder begin-drempel → charge naar end-of-hour target.
                 for k in seg_hours:
-                    soc_before    = soc
-                    net_w         = net_kw_arr[k] * 1000
-                    pct_k         = analysis[k].get("pct")
-                    survival_here = min(_survival_soc_from(k, pct_k), ceiling)
+                    soc_before       = soc
+                    net_w            = net_kw_arr[k] * 1000
+                    pct_k            = analysis[k].get("pct")
+                    survival_start   = min(_survival_soc_from(k, pct_k), ceiling)
+                    survival_end     = min(_survival_soc_from(k + 1, pct_k), ceiling)
 
-                    if soc >= survival_here:
-                        # Genoeg SOC: ontladen (batterij levert netto verbruik)
-                        soc      = max(min_soc, soc - _kwh_to_soc(max(0.0, net_kw_arr[k])))
-                        mode     = "discharge"
-                        target_w = GRID_MIN_W
+                    if soc >= survival_start:
+                        # Genoeg SOC: goedkope dip-uren blijven bidirectioneel.
+                        target_w = 0
+                        soc      = max(min_soc, min(max_soc, soc - _kwh_to_soc(net_kw_arr[k] - (target_w / 1000.0))))
+                        mode     = "level"
                     else:
-                        # Te weinig SOC: laden naar survival_here
-                        gain     = survival_here - soc_before
+                        # Te weinig SOC aan het begin van dit uur: laden naar de
+                        # end-of-hour survival target voor de resterende horizon.
+                        gain     = survival_end - soc_before
                         soc      = min(max_soc, soc_before + gain)
                         gain     = soc - soc_before
                         mode     = "charge"
@@ -516,15 +596,15 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
                     decisions.append({
                         "mode":           mode,
                         "target_grid_w":  target_w,
-                        "expected_soc":   round(soc, 1),
+                        "target_soc":     round(soc, 1),
                     })
 
             i = j
 
         else:
-            # ── Non-cheap segment (tier 3/4/5): altijd discharge ─────────────
-            # Alle tiers: batterij levert netto verbruik; target = GRID_MIN_W (≈0W)
-            # Alleen als tier 0 volgt: waterfall over tier 4/5 → target kan negatief
+            # ── Non-cheap segment (tier 3/4/5) ────────────────────────────────
+            # Tier 3: level rond GRID_MIN_W (bidirectioneel)
+            # Tier 4/5: discharge; bij tier 0 volgt eventueel waterfall / export
             j = i
             while j < n and tiers[j] > 2:
                 j += 1
@@ -578,26 +658,35 @@ def battery_strategy(pv, hp, hh, ev_kw, analysis, soc_now,
             for k in seg_hours:
                 t   = min(5, max(3, tiers[k]))
                 net = net_kw_arr[k]
+                tier_target_w = 0
 
-                if net > 0:
+                if t == 3:
+                    bat_kw = net - (tier_target_w / 1000.0)
+                    soc = max(min_soc, min(max_soc, soc - bat_kw / usable * 100.0))
+                    mode = "level"
+                    target_grid_w = tier_target_w
+                elif net > 0:
                     if t >= 4:
                         bat_kw        = frac[t] * net
                         _raw          = round((1.0 - frac[t]) * net * 1000)
                         target_grid_w = max(-GRID_EXPORT_LIMIT,
-                                            _raw if _raw < 0 else max(GRID_MIN_W, _raw))
+                                            _raw if _raw < 0 else max(tier_target_w, _raw))
                     else:
-                        # Tier 3: batterij levert alles, target = GRID_MIN_W
                         bat_kw        = net
-                        target_grid_w = GRID_MIN_W
+                        target_grid_w = tier_target_w
                     soc = max(min_soc, soc - bat_kw / usable * 100.0)
+                    mode = "discharge"
                 else:
-                    # PV surplus: batterij standby
-                    target_grid_w = GRID_MIN_W
+                    # Tier 4/5 met PV-surplus: controller blijft in discharge,
+                    # maar target blijft op anti-export.
+                    target_grid_w = tier_target_w
+                    bat_kw = 0.0
+                    mode = "discharge"
 
                 decisions.append({
-                    "mode":           "discharge",
+                    "mode":           mode,
                     "target_grid_w":  target_grid_w,
-                    "expected_soc":   round(soc, 1),
+                    "target_soc":     round(soc, 1),
                 })
 
             i = j
@@ -689,7 +778,7 @@ def wpb_strategy(prices, pv, hp, hh, analysis, boiler_temp,
     for i, ha in enumerate(analysis):
         net   = pv[i] - hp[i] - hh[i]
         price = prices[i]
-        cls   = ha["label"]
+        cls   = ha.get("label", "neutral")
 
         if cls == "trough" and price <= boost_max_price and boiler_temp < boost_max_c:
             mode   = "boost"

@@ -133,6 +133,47 @@ def history_to_hourly_cumul_change(states, tz_offset=None):
     return result
 
 
+def history_to_hourly_cumul_signed_change(states, tz_offset=None):
+    """
+    Convert AppDaemon raw-history states for a cumulative sensor that may move
+    both up and down (for example net grid import-export) into per-hour signed
+    delta tuples (local_date, local_hour, kwh_change).
+    """
+    parsed = []
+    for s in states:
+        try:
+            v  = float(s["state"])
+            dt = _parse_utc(s["last_changed"])
+            parsed.append((dt, v))
+        except Exception:
+            continue
+
+    if len(parsed) < 2:
+        return []
+
+    parsed.sort(key=lambda x: x[0])
+
+    by_hour = defaultdict(list)
+    for dt_utc, v in parsed:
+        tz    = tz_offset if tz_offset is not None else _ams_offset(dt_utc.date())
+        local = dt_utc + datetime.timedelta(hours=tz)
+        key   = (local.date(), local.hour)
+        by_hour[key].append(v)
+
+    result = []
+    keys   = sorted(by_hour)
+    for i in range(1, len(keys)):
+        prev_k, curr_k = keys[i - 1], keys[i]
+        prev_dt = datetime.datetime.combine(prev_k[0], datetime.time(prev_k[1]))
+        curr_dt = datetime.datetime.combine(curr_k[0], datetime.time(curr_k[1]))
+        if (curr_dt - prev_dt).total_seconds() > 7200:
+            continue
+        change = by_hour[curr_k][-1] - by_hour[prev_k][-1]
+        result.append((curr_k[0], curr_k[1], round(change, 4)))
+
+    return result
+
+
 def history_to_hourly_mean(states, tz_offset=None):
     """
     Convert AppDaemon raw-history states for a *measurement* sensor into
