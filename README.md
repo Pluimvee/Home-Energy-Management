@@ -33,7 +33,7 @@ When we recieve new EPEX price info detect the turning points (TP) and assign th
 | 4 | crest | Above average |
 | 5 | peak | High price 
 
-<img width="796" height="358" alt="image" src="https://github.com/user-attachments/assets/a3bea1d3-a798-4cfa-8fe0-dcaedbe3d3a1" />
+<img width="1060" height="355" alt="image" src="https://github.com/user-attachments/assets/097668c8-87fe-43ff-871c-194a22131efa" />
 
 ## Strategy for CH, DHW, EV, and battery ##
 These tiers together with the forecasts of house usage (thuis), PV generation (PV) and heatpump usage (WP) we set a strategy for 
@@ -42,7 +42,7 @@ These tiers together with the forecasts of house usage (thuis), PV generation (P
 - EV charger (EV): can be set to off, slow (10amps) fast (16 amps) and is using a sensor 'time-when-i-need-my-car'
 - battery control (Bat): to control charge and discharge, with expected SOC and target grid export/import
 
-<img width="974" height="771" alt="image" src="https://github.com/user-attachments/assets/01d99fc2-5619-425f-90ee-d977e8b1bfe2" />
+<img width="984" height="770" alt="image" src="https://github.com/user-attachments/assets/39195ccc-aabc-4072-abd8-c79fdce71bb3" />
 
 
 
